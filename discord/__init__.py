@@ -13,7 +13,7 @@ __title__ = 'discord'
 __author__ = 'Rapptz'
 __license__ = 'MIT'
 __copyright__ = 'Copyright 2015-present Rapptz'
-__version__ = '2.0.0a'
+__version__ = '2.5.0a'
 
 __path__ = __import__('pkgutil').extend_path(__path__, __name__)
 
@@ -40,10 +40,18 @@ from .colour import *
 from .integrations import *
 from .invite import *
 from .template import *
+from .welcome_screen import *
+from .sku import *
 from .widget import *
 from .object import *
 from .reaction import *
-from . import utils, opus, abc, ui, app_commands
+from . import (
+    utils as utils,
+    opus as opus,
+    abc as abc,
+    ui as ui,
+    app_commands as app_commands,
+)
 from .enums import *
 from .embeds import *
 from .mentions import *
@@ -60,6 +68,11 @@ from .scheduled_event import *
 from .interactions import *
 from .components import *
 from .threads import *
+from .automod import *
+from .poll import *
+from .soundboard import *
+from .subscription import *
+from .presences import *
 
 
 class VersionInfo(NamedTuple):
@@ -70,6 +83,14 @@ class VersionInfo(NamedTuple):
     serial: int
 
 
-version_info: VersionInfo = VersionInfo(major=2, minor=0, micro=0, releaselevel='alpha', serial=0)
+version_info: VersionInfo = VersionInfo(major=2, minor=5, micro=0, releaselevel='alpha', serial=0)
 
 logging.getLogger(__name__).addHandler(logging.NullHandler())
+
+# This is a backwards compatibility hack and should be removed in v3
+# Essentially forcing the exception to have different base classes
+# In the future, this should only inherit from ClientException
+if len(MissingApplicationID.__bases__) == 1:
+    MissingApplicationID.__bases__ = (app_commands.AppCommandError, ClientException)
+
+del logging, NamedTuple, Literal, VersionInfo

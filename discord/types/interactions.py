@@ -25,21 +25,25 @@ DEALINGS IN THE SOFTWARE.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Dict, List, Literal, TypedDict, Union
+from typing_extensions import NotRequired
 
-
-from .channel import ChannelTypeWithoutThread, ThreadMetadata
+from .channel import ChannelTypeWithoutThread, ThreadMetadata, GuildChannel, InteractionDMChannel, GroupDMChannel
+from .sku import Entitlement
 from .threads import ThreadType
 from .member import Member
 from .message import Attachment
 from .role import Role
 from .snowflake import Snowflake
 from .user import User
+from .guild import GuildFeature
 
 if TYPE_CHECKING:
     from .message import Message
 
 
 InteractionType = Literal[1, 2, 3, 4, 5]
+InteractionContextType = Literal[0, 1, 2]
+InteractionInstallationType = Literal[0, 1]
 
 
 class _BasePartialChannel(TypedDict):
@@ -65,6 +69,12 @@ class ResolvedData(TypedDict, total=False):
     channels: Dict[str, Union[PartialChannel, PartialThread]]
     messages: Dict[str, Message]
     attachments: Dict[str, Attachment]
+
+
+class PartialInteractionGuild(TypedDict):
+    id: Snowflake
+    locale: str
+    features: List[GuildFeature]
 
 
 class _BaseApplicationCommandInteractionDataOption(TypedDict):
@@ -120,14 +130,11 @@ ApplicationCommandInteractionDataOption = Union[
 ]
 
 
-class _BaseApplicationCommandInteractionDataOptional(TypedDict, total=False):
-    resolved: ResolvedData
-    guild_id: Snowflake
-
-
-class _BaseApplicationCommandInteractionData(_BaseApplicationCommandInteractionDataOptional):
+class _BaseApplicationCommandInteractionData(TypedDict):
     id: Snowflake
     name: str
+    resolved: NotRequired[ResolvedData]
+    guild_id: NotRequired[Snowflake]
 
 
 class ChatInputApplicationCommandInteractionData(_BaseApplicationCommandInteractionData, total=False):
@@ -159,12 +166,13 @@ class _BaseMessageComponentInteractionData(TypedDict):
 
 
 class ButtonMessageComponentInteractionData(_BaseMessageComponentInteractionData):
-    type: Literal[2]
+    component_type: Literal[2]
 
 
 class SelectMessageComponentInteractionData(_BaseMessageComponentInteractionData):
-    component_type: Literal[3]
+    component_type: Literal[3, 5, 6, 7, 8]
     values: List[str]
+    resolved: NotRequired[ResolvedData]
 
 
 MessageComponentInteractionData = Union[ButtonMessageComponentInteractionData, SelectMessageComponentInteractionData]
@@ -189,7 +197,7 @@ ModalSubmitComponentInteractionData = Union[ModalSubmitActionRowInteractionData,
 
 class ModalSubmitInteractionData(TypedDict):
     custom_id: str
-    components: List[ModalSubmitActionRowInteractionData]
+    components: List[ModalSubmitComponentInteractionData]
 
 
 InteractionData = Union[
@@ -199,18 +207,22 @@ InteractionData = Union[
 ]
 
 
-class _BaseInteractionOptional(TypedDict, total=False):
-    guild_id: Snowflake
-    channel_id: Snowflake
-    locale: str
-    guild_locale: str
-
-
-class _BaseInteraction(_BaseInteractionOptional):
+class _BaseInteraction(TypedDict):
     id: Snowflake
     application_id: Snowflake
     token: str
     version: Literal[1]
+    guild_id: NotRequired[Snowflake]
+    guild: NotRequired[PartialInteractionGuild]
+    channel_id: NotRequired[Snowflake]
+    channel: Union[GuildChannel, InteractionDMChannel, GroupDMChannel]
+    app_permissions: NotRequired[str]
+    locale: NotRequired[str]
+    guild_locale: NotRequired[str]
+    entitlement_sku_ids: NotRequired[List[Snowflake]]
+    entitlements: NotRequired[List[Entitlement]]
+    authorizing_integration_owners: Dict[Literal['0', '1'], Snowflake]
+    context: NotRequired[InteractionContextType]
 
 
 class PingInteraction(_BaseInteraction):
@@ -240,3 +252,52 @@ class MessageInteraction(TypedDict):
     type: InteractionType
     name: str
     user: User
+    member: NotRequired[Member]
+
+
+class _MessageInteractionMetadata(TypedDict):
+    id: Snowflake
+    user: User
+    authorizing_integration_owners: Dict[Literal['0', '1'], Snowflake]
+    original_response_message_id: NotRequired[Snowflake]
+
+
+class _ApplicationCommandMessageInteractionMetadata(_MessageInteractionMetadata):
+    type: Literal[2]
+    # command_type: Literal[1, 2, 3, 4]
+
+
+class UserApplicationCommandMessageInteractionMetadata(_ApplicationCommandMessageInteractionMetadata):
+    # command_type: Literal[2]
+    target_user: User
+
+
+class MessageApplicationCommandMessageInteractionMetadata(_ApplicationCommandMessageInteractionMetadata):
+    # command_type: Literal[3]
+    target_message_id: Snowflake
+
+
+ApplicationCommandMessageInteractionMetadata = Union[
+    _ApplicationCommandMessageInteractionMetadata,
+    UserApplicationCommandMessageInteractionMetadata,
+    MessageApplicationCommandMessageInteractionMetadata,
+]
+
+
+class MessageComponentMessageInteractionMetadata(_MessageInteractionMetadata):
+    type: Literal[3]
+    interacted_message_id: Snowflake
+
+
+class ModalSubmitMessageInteractionMetadata(_MessageInteractionMetadata):
+    type: Literal[5]
+    triggering_interaction_metadata: Union[
+        ApplicationCommandMessageInteractionMetadata, MessageComponentMessageInteractionMetadata
+    ]
+
+
+MessageInteractionMetadata = Union[
+    ApplicationCommandMessageInteractionMetadata,
+    MessageComponentMessageInteractionMetadata,
+    ModalSubmitMessageInteractionMetadata,
+]

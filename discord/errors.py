@@ -27,13 +27,9 @@ from typing import Dict, List, Optional, TYPE_CHECKING, Any, Tuple, Union
 
 if TYPE_CHECKING:
     from aiohttp import ClientResponse, ClientWebSocketResponse
+    from requests import Response
 
-    try:
-        from requests import Response
-
-        _ResponseType = Union[ClientResponse, Response]
-    except ModuleNotFoundError:
-        _ResponseType = ClientResponse
+    _ResponseType = Union[ClientResponse, Response]
 
     from .interactions import Interaction
 
@@ -42,6 +38,7 @@ __all__ = (
     'ClientException',
     'GatewayNotFound',
     'HTTPException',
+    'RateLimited',
     'Forbidden',
     'NotFound',
     'DiscordServerError',
@@ -50,6 +47,12 @@ __all__ = (
     'ConnectionClosed',
     'PrivilegedIntentsRequired',
     'InteractionResponded',
+    'MissingApplicationID',
+)
+
+APP_ID_NOT_FOUND = (
+    'Client does not have an application_id set. Either the function was called before on_ready '
+    'was called or application_id was not passed to the Client constructor.'
 )
 
 
@@ -117,13 +120,14 @@ class HTTPException(DiscordException):
 
     def __init__(self, response: _ResponseType, message: Optional[Union[str, Dict[str, Any]]]):
         self.response: _ResponseType = response
-        self.status: int = response.status  # type: ignore - This attribute is filled by the library even if using requests
+        self.status: int = response.status  # type: ignore # This attribute is filled by the library even if using requests
         self.code: int
         self.text: str
         if isinstance(message, dict):
             self.code = message.get('code', 0)
             base = message.get('message', '')
             errors = message.get('errors')
+            self._errors: Optional[Dict[str, Any]] = errors
             if errors:
                 errors = _flatten_error_dict(errors)
                 helpful = '\n'.join('In %s: %s' % t for t in errors.items())
@@ -139,6 +143,30 @@ class HTTPException(DiscordException):
             fmt += ': {2}'
 
         super().__init__(fmt.format(self.response, self.code, self.text))
+
+
+class RateLimited(DiscordException):
+    """Exception that's raised for when status code 429 occurs
+    and the timeout is greater than the configured maximum using
+    the ``max_ratelimit_timeout`` parameter in :class:`Client`.
+
+    This is not raised during global ratelimits.
+
+    Since sometimes requests are halted pre-emptively before they're
+    even made, this **does not** subclass :exc:`HTTPException`.
+
+    .. versionadded:: 2.0
+
+    Attributes
+    ------------
+    retry_after: :class:`float`
+        The amount of seconds that the client should wait before retrying
+        the request.
+    """
+
+    def __init__(self, retry_after: float):
+        self.retry_after = retry_after
+        super().__init__(f'Too many requests. Retry in {retry_after:.2f} seconds.')
 
 
 class Forbidden(HTTPException):
@@ -220,6 +248,7 @@ class PrivilegedIntentsRequired(ClientException):
 
     - :attr:`Intents.members`
     - :attr:`Intents.presences`
+    - :attr:`Intents.message_content`
 
     Attributes
     -----------
@@ -255,3 +284,22 @@ class InteractionResponded(ClientException):
     def __init__(self, interaction: Interaction):
         self.interaction: Interaction = interaction
         super().__init__('This interaction has already been responded to before')
+
+
+class MissingApplicationID(ClientException):
+    """An exception raised when the client does not have an application ID set.
+
+    An application ID is required for syncing application commands and various
+    other application tasks such as SKUs or application emojis.
+
+    This inherits from :exc:`~discord.app_commands.AppCommandError`
+    and :class:`~discord.ClientException`.
+
+    .. versionadded:: 2.0
+
+    .. versionchanged:: 2.5
+        This is now exported to the ``discord`` namespace and now inherits from :class:`~discord.ClientException`.
+    """
+
+    def __init__(self, message: Optional[str] = None):
+        super().__init__(message or APP_ID_NOT_FOUND)

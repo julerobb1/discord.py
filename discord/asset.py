@@ -29,6 +29,7 @@ import os
 from typing import Any, Literal, Optional, TYPE_CHECKING, Tuple, Union
 from .errors import DiscordException
 from . import utils
+from .file import File
 
 import yarl
 
@@ -57,6 +58,7 @@ MISSING = utils.MISSING
 
 
 class AssetMixin:
+    __slots__ = ()
     url: str
     _state: Optional[Any]
 
@@ -92,7 +94,7 @@ class AssetMixin:
         Parameters
         ----------
         fp: Union[:class:`io.BufferedIOBase`, :class:`os.PathLike`]
-            The file-like object to save this attachment to or the filename
+            The file-like object to save this asset to or the filename
             to use. If a filename is passed then a file is created with that
             filename and used instead.
         seek_begin: :class:`bool`
@@ -123,6 +125,53 @@ class AssetMixin:
         else:
             with open(fp, 'wb') as f:
                 return f.write(data)
+
+    async def to_file(
+        self,
+        *,
+        filename: Optional[str] = MISSING,
+        description: Optional[str] = None,
+        spoiler: bool = False,
+    ) -> File:
+        """|coro|
+
+        Converts the asset into a :class:`File` suitable for sending via
+        :meth:`abc.Messageable.send`.
+
+        .. versionadded:: 2.0
+
+        Parameters
+        -----------
+        filename: Optional[:class:`str`]
+            The filename of the file. If not provided, then the filename from
+            the asset's URL is used.
+        description: Optional[:class:`str`]
+            The description for the file.
+        spoiler: :class:`bool`
+            Whether the file is a spoiler.
+
+        Raises
+        ------
+        DiscordException
+            The asset does not have an associated state.
+        ValueError
+            The asset is a unicode emoji.
+        TypeError
+            The asset is a sticker with lottie type.
+        HTTPException
+            Downloading the asset failed.
+        NotFound
+            The asset was deleted.
+
+        Returns
+        -------
+        :class:`File`
+            The asset as a file suitable for sending.
+        """
+
+        data = await self.read()
+        file_filename = filename if filename is not MISSING else yarl.URL(self.url).name
+        return File(io.BytesIO(data), filename=file_filename, description=description, spoiler=spoiler)
 
 
 class Asset(AssetMixin):
@@ -198,10 +247,41 @@ class Asset(AssetMixin):
         )
 
     @classmethod
+    def _from_guild_banner(cls, state: _State, guild_id: int, member_id: int, banner: str) -> Self:
+        animated = banner.startswith('a_')
+        format = 'gif' if animated else 'png'
+        return cls(
+            state,
+            url=f"{cls.BASE}/guilds/{guild_id}/users/{member_id}/banners/{banner}.{format}?size=1024",
+            key=banner,
+            animated=animated,
+        )
+
+    @classmethod
+    def _from_avatar_decoration(cls, state: _State, avatar_decoration: str) -> Self:
+        return cls(
+            state,
+            url=f'{cls.BASE}/avatar-decoration-presets/{avatar_decoration}.png?size=96',
+            key=avatar_decoration,
+            animated=True,
+        )
+
+    @classmethod
     def _from_icon(cls, state: _State, object_id: int, icon_hash: str, path: str) -> Self:
         return cls(
             state,
             url=f'{cls.BASE}/{path}-icons/{object_id}/{icon_hash}.png?size=1024',
+            key=icon_hash,
+            animated=False,
+        )
+
+    @classmethod
+    def _from_app_icon(
+        cls, state: _State, object_id: int, icon_hash: str, asset_type: Literal['icon', 'cover_image']
+    ) -> Self:
+        return cls(
+            state,
+            url=f'{cls.BASE}/app-icons/{object_id}/{asset_type}.png?size=1024',
             key=icon_hash,
             animated=False,
         )
@@ -305,6 +385,11 @@ class Asset(AssetMixin):
     ) -> Self:
         """Returns a new asset with the passed components replaced.
 
+
+        .. versionchanged:: 2.0
+            ``static_format`` is now preferred over ``format``
+            if both are present and the asset is not animated.
+
         .. versionchanged:: 2.0
             This function will now raise :exc:`ValueError` instead of
             ``InvalidArgument``.
@@ -338,7 +423,7 @@ class Asset(AssetMixin):
                 if format not in VALID_ASSET_FORMATS:
                     raise ValueError(f'format must be one of {VALID_ASSET_FORMATS}')
             else:
-                if format not in VALID_STATIC_FORMATS:
+                if static_format is MISSING and format not in VALID_STATIC_FORMATS:
                     raise ValueError(f'format must be one of {VALID_STATIC_FORMATS}')
             url = url.with_path(f'{path}.{format}')
 
@@ -355,7 +440,7 @@ class Asset(AssetMixin):
             url = url.with_query(url.raw_query_string)
 
         url = str(url)
-        return Asset(state=self._state, url=url, key=self._key, animated=self._animated)
+        return self.__class__(state=self._state, url=url, key=self._key, animated=self._animated)
 
     def with_size(self, size: int, /) -> Self:
         """Returns a new asset with the specified size.
@@ -383,7 +468,7 @@ class Asset(AssetMixin):
             raise ValueError('size must be a power of 2 between 16 and 4096')
 
         url = str(yarl.URL(self._url).with_query(size=size))
-        return Asset(state=self._state, url=url, key=self._key, animated=self._animated)
+        return self.__class__(state=self._state, url=url, key=self._key, animated=self._animated)
 
     def with_format(self, format: ValidAssetFormatTypes, /) -> Self:
         """Returns a new asset with the specified format.
@@ -418,7 +503,7 @@ class Asset(AssetMixin):
         url = yarl.URL(self._url)
         path, _ = os.path.splitext(url.path)
         url = str(url.with_path(f'{path}.{format}').with_query(url.raw_query_string))
-        return Asset(state=self._state, url=url, key=self._key, animated=self._animated)
+        return self.__class__(state=self._state, url=url, key=self._key, animated=self._animated)
 
     def with_static_format(self, format: ValidStaticFormatTypes, /) -> Self:
         """Returns a new asset with the specified static format.

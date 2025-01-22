@@ -24,37 +24,17 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
-from .errors import (
-    BadFlagArgument,
-    CommandError,
-    MissingFlagArgument,
-    TooManyFlags,
-    MissingRequiredFlag,
-)
-
-from discord.utils import resolve_annotation
-from .view import StringView
-from .converter import run_converters
-
-from discord.utils import maybe_coroutine, MISSING
-from dataclasses import dataclass, field
-from typing import (
-    Dict,
-    Iterator,
-    Literal,
-    Optional,
-    Pattern,
-    Set,
-    TYPE_CHECKING,
-    Tuple,
-    List,
-    Any,
-    Union,
-)
-
 import inspect
-import sys
 import re
+import sys
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Literal, Optional, Pattern, Set, Tuple, Type, Union
+
+from discord.utils import MISSING, maybe_coroutine, resolve_annotation
+
+from .converter import run_converters
+from .errors import BadFlagArgument, MissingFlagArgument, MissingRequiredFlag, TooManyFlags, TooManyArguments
+from .view import StringView
 
 __all__ = (
     'Flag',
@@ -64,11 +44,11 @@ __all__ = (
 
 
 if TYPE_CHECKING:
-    from typing_extensions import Self
-
-    from .context import Context
+    from typing_extensions import Self, TypeGuard
 
     from ._types import BotT
+    from .context import Context
+    from .parameters import Parameter
 
 
 @dataclass
@@ -96,6 +76,13 @@ class Flag:
         A negative value indicates an unlimited amount of arguments.
     override: :class:`bool`
         Whether multiple given values overrides the previous value.
+    description: :class:`str`
+        The description of the flag. Shown for hybrid commands when they're
+        used as application commands.
+    positional: :class:`bool`
+        Whether the flag is positional or not. There can only be one positional flag.
+
+        .. versionadded:: 2.4
     """
 
     name: str = MISSING
@@ -105,6 +92,8 @@ class Flag:
     default: Any = MISSING
     max_args: int = MISSING
     override: bool = MISSING
+    description: str = MISSING
+    positional: bool = MISSING
     cast_to_dict: bool = False
 
     @property
@@ -123,6 +112,9 @@ def flag(
     default: Any = MISSING,
     max_args: int = MISSING,
     override: bool = MISSING,
+    converter: Any = MISSING,
+    description: str = MISSING,
+    positional: bool = MISSING,
 ) -> Any:
     """Override default functionality and parameters of the underlying :class:`FlagConverter`
     class attributes.
@@ -144,8 +136,31 @@ def flag(
     override: :class:`bool`
         Whether multiple given values overrides the previous value. The default
         value depends on the annotation given.
+    converter: Any
+        The converter to use for this flag. This replaces the annotation at
+        runtime which is transparent to type checkers.
+    description: :class:`str`
+        The description of the flag. Shown for hybrid commands when they're
+        used as application commands.
+    positional: :class:`bool`
+        Whether the flag is positional or not. There can only be one positional flag.
+
+        .. versionadded:: 2.4
     """
-    return Flag(name=name, aliases=aliases, default=default, max_args=max_args, override=override)
+    return Flag(
+        name=name,
+        aliases=aliases,
+        default=default,
+        max_args=max_args,
+        override=override,
+        annotation=converter,
+        description=description,
+        positional=positional,
+    )
+
+
+def is_flag(obj: Any) -> TypeGuard[Type[FlagConverter]]:
+    return hasattr(obj, '__commands_is_flag__')
 
 
 def validate_flag_name(name: str, forbidden: Set[str]) -> None:
@@ -167,16 +182,23 @@ def get_flags(namespace: Dict[str, Any], globals: Dict[str, Any], locals: Dict[s
     flags: Dict[str, Flag] = {}
     cache: Dict[str, Any] = {}
     names: Set[str] = set()
+    positional: Optional[Flag] = None
     for name, annotation in annotations.items():
         flag = namespace.pop(name, MISSING)
         if isinstance(flag, Flag):
-            flag.annotation = annotation
+            if flag.annotation is MISSING:
+                flag.annotation = annotation
         else:
             flag = Flag(name=name, annotation=annotation, default=flag)
 
         flag.attribute = name
         if flag.name is MISSING:
             flag.name = name
+
+        if flag.positional:
+            if positional is not None:
+                raise TypeError(f"{flag.name!r} positional flag conflicts with {positional.name!r} flag.")
+            positional = flag
 
         annotation = flag.annotation = resolve_annotation(flag.annotation, globals, locals, cache)
 
@@ -265,6 +287,7 @@ class FlagsMeta(type):
         __commands_flag_case_insensitive__: bool
         __commands_flag_delimiter__: str
         __commands_flag_prefix__: str
+        __commands_flag_positional__: Optional[Flag]
 
     def __new__(
         cls,
@@ -275,7 +298,7 @@ class FlagsMeta(type):
         case_insensitive: bool = MISSING,
         delimiter: str = MISSING,
         prefix: str = MISSING,
-    ) -> Self:
+    ) -> FlagsMeta:
         attrs['__commands_is_flag__'] = True
 
         try:
@@ -319,9 +342,13 @@ class FlagsMeta(type):
         delimiter = attrs.setdefault('__commands_flag_delimiter__', ':')
         prefix = attrs.setdefault('__commands_flag_prefix__', '')
 
+        positional: Optional[Flag] = None
         for flag_name, flag in get_flags(attrs, global_ns, local_ns).items():
             flags[flag_name] = flag
             aliases.update({alias_name: flag_name for alias_name in flag.aliases})
+            if flag.positional:
+                positional = flag
+        attrs['__commands_flag_positional__'] = positional
 
         forbidden = set(delimiter).union(prefix)
         for flag_name in flags:
@@ -335,9 +362,9 @@ class FlagsMeta(type):
             aliases = {key.casefold(): value.casefold() for key, value in aliases.items()}
             regex_flags = re.IGNORECASE
 
-        keys = list(re.escape(k) for k in flags)
+        keys = [re.escape(k) for k in flags]
         keys.extend(re.escape(a) for a in aliases)
-        keys = sorted(keys, key=lambda t: len(t), reverse=True)
+        keys = sorted(keys, key=len, reverse=True)
 
         joined = '|'.join(keys)
         pattern = re.compile(f'(({re.escape(prefix)})(?P<flag>{joined}){re.escape(delimiter)})', regex_flags)
@@ -351,7 +378,7 @@ class FlagsMeta(type):
 async def tuple_convert_all(ctx: Context[BotT], argument: str, flag: Flag, converter: Any) -> Tuple[Any, ...]:
     view = StringView(argument)
     results = []
-    param: inspect.Parameter = ctx.current_parameter  # type: ignore
+    param: Parameter = ctx.current_parameter  # type: ignore
     while not view.eof:
         view.skip_ws()
         if view.eof:
@@ -363,10 +390,8 @@ async def tuple_convert_all(ctx: Context[BotT], argument: str, flag: Flag, conve
 
         try:
             converted = await run_converters(ctx, converter, word, param)
-        except CommandError:
-            raise
         except Exception as e:
-            raise BadFlagArgument(flag) from e
+            raise BadFlagArgument(flag, word, e) from e
         else:
             results.append(converted)
 
@@ -376,7 +401,7 @@ async def tuple_convert_all(ctx: Context[BotT], argument: str, flag: Flag, conve
 async def tuple_convert_flag(ctx: Context[BotT], argument: str, flag: Flag, converters: Any) -> Tuple[Any, ...]:
     view = StringView(argument)
     results = []
-    param: inspect.Parameter = ctx.current_parameter  # type: ignore
+    param: Parameter = ctx.current_parameter  # type: ignore
     for converter in converters:
         view.skip_ws()
         if view.eof:
@@ -388,21 +413,19 @@ async def tuple_convert_flag(ctx: Context[BotT], argument: str, flag: Flag, conv
 
         try:
             converted = await run_converters(ctx, converter, word, param)
-        except CommandError:
-            raise
         except Exception as e:
-            raise BadFlagArgument(flag) from e
+            raise BadFlagArgument(flag, word, e) from e
         else:
             results.append(converted)
 
     if len(results) != len(converters):
-        raise BadFlagArgument(flag)
+        raise MissingFlagArgument(flag)
 
     return tuple(results)
 
 
 async def convert_flag(ctx: Context[BotT], argument: str, flag: Flag, annotation: Any = None) -> Any:
-    param: inspect.Parameter = ctx.current_parameter  # type: ignore
+    param: Parameter = ctx.current_parameter  # type: ignore
     annotation = annotation or flag.annotation
     try:
         origin = annotation.__origin__
@@ -428,10 +451,8 @@ async def convert_flag(ctx: Context[BotT], argument: str, flag: Flag, annotation
 
     try:
         return await run_converters(ctx, annotation, argument, param)
-    except CommandError:
-        raise
     except Exception as e:
-        raise BadFlagArgument(flag) from e
+        raise BadFlagArgument(flag, argument, e) from e
 
 
 class FlagConverter(metaclass=FlagsMeta):
@@ -485,6 +506,7 @@ class FlagConverter(metaclass=FlagsMeta):
         flags = cls.__commands_flags__
         for flag in flags.values():
             if callable(flag.default):
+                # Type checker does not understand that flag.default is a Callable
                 default = await maybe_coroutine(flag.default, ctx)
                 setattr(self, flag.attribute, default)
             else:
@@ -496,14 +518,29 @@ class FlagConverter(metaclass=FlagsMeta):
         return f'<{self.__class__.__name__} {pairs}>'
 
     @classmethod
-    def parse_flags(cls, argument: str) -> Dict[str, List[str]]:
+    def parse_flags(cls, argument: str, *, ignore_extra: bool = True) -> Dict[str, List[str]]:
         result: Dict[str, List[str]] = {}
         flags = cls.__commands_flags__
         aliases = cls.__commands_flag_aliases__
+        positional_flag = cls.__commands_flag_positional__
         last_position = 0
         last_flag: Optional[Flag] = None
 
         case_insensitive = cls.__commands_flag_case_insensitive__
+
+        if positional_flag is not None:
+            match = cls.__commands_flag_regex__.search(argument)
+            if match is not None:
+                begin, end = match.span(0)
+                value = argument[:begin].strip()
+            else:
+                value = argument.strip()
+                last_position = len(argument)
+
+            if value:
+                name = positional_flag.name.casefold() if case_insensitive else positional_flag.name
+                result[name] = [value]
+
         for match in cls.__commands_flag_regex__.finditer(argument):
             begin, end = match.span(0)
             key = match.group('flag')
@@ -519,28 +556,37 @@ class FlagConverter(metaclass=FlagsMeta):
                 if not value:
                     raise MissingFlagArgument(last_flag)
 
+                name = last_flag.name.casefold() if case_insensitive else last_flag.name
+
                 try:
-                    values = result[last_flag.name]
+                    values = result[name]
                 except KeyError:
-                    result[last_flag.name] = [value]
+                    result[name] = [value]
                 else:
                     values.append(value)
 
             last_position = end
             last_flag = flag
 
+        # Get the remaining string, if applicable
+        value = argument[last_position:].strip()
+
         # Add the remaining string to the last available flag
-        if last_position and last_flag is not None:
-            value = argument[last_position:].strip()
+        if last_flag is not None:
             if not value:
                 raise MissingFlagArgument(last_flag)
 
+            name = last_flag.name.casefold() if case_insensitive else last_flag.name
+
             try:
-                values = result[last_flag.name]
+                values = result[name]
             except KeyError:
-                result[last_flag.name] = [value]
+                result[name] = [value]
             else:
                 values.append(value)
+        elif value and not ignore_extra:
+            # If we're here then we passed extra arguments that aren't flags
+            raise TooManyArguments(f'Too many arguments passed to {cls.__name__}')
 
         # Verification of values will come at a later stage
         return result
@@ -553,8 +599,6 @@ class FlagConverter(metaclass=FlagsMeta):
 
         Parameters
         ----------
-        cls: Type[:class:`FlagConverter`]
-            The flag converter class.
         ctx: :class:`Context`
             The invocation context.
         argument: :class:`str`
@@ -564,15 +608,23 @@ class FlagConverter(metaclass=FlagsMeta):
         --------
         FlagError
             A flag related parsing error.
-        CommandError
-            A command related error.
 
         Returns
         --------
         :class:`FlagConverter`
             The flag converter instance with all flags parsed.
         """
-        arguments = cls.parse_flags(argument)
+
+        # Only respect ignore_extra if the parameter is a keyword-only parameter
+        ignore_extra = True
+        if (
+            ctx.command is not None
+            and ctx.current_parameter is not None
+            and ctx.current_parameter.kind == ctx.current_parameter.KEYWORD_ONLY
+        ):
+            ignore_extra = ctx.command.ignore_extra
+
+        arguments = cls.parse_flags(argument, ignore_extra=ignore_extra)
         flags = cls.__commands_flags__
 
         self = cls.__new__(cls)
@@ -584,6 +636,7 @@ class FlagConverter(metaclass=FlagsMeta):
                     raise MissingRequiredFlag(flag)
                 else:
                     if callable(flag.default):
+                        # Type checker does not understand flag.default is a Callable
                         default = await maybe_coroutine(flag.default, ctx)
                         setattr(self, flag.attribute, default)
                     else:

@@ -24,7 +24,7 @@ DEALINGS IN THE SOFTWARE.
 
 from __future__ import annotations
 
-from typing import Callable, Optional, TYPE_CHECKING, Tuple, TypeVar, Union
+from typing import Callable, Literal, Optional, TYPE_CHECKING, Tuple, TypeVar, Union
 import inspect
 import os
 
@@ -61,12 +61,14 @@ class Button(Item[V]):
     custom_id: Optional[:class:`str`]
         The ID of the button that gets received during an interaction.
         If this button is for a URL, it does not have a custom ID.
+        Can only be up to 100 characters.
     url: Optional[:class:`str`]
         The URL this button sends you to.
     disabled: :class:`bool`
         Whether the button is disabled or not.
     label: Optional[:class:`str`]
         The label of the button, if any.
+        Can only be up to 80 characters.
     emoji: Optional[Union[:class:`.PartialEmoji`, :class:`.Emoji`, :class:`str`]]
         The emoji of the button, if available.
     row: Optional[:class:`int`]
@@ -75,6 +77,11 @@ class Button(Item[V]):
         like to control the relative positioning of the row then passing an index is advised.
         For example, row=1 will show up before row=2. Defaults to ``None``, which is automatic
         ordering. The row number must be between 0 and 4 (i.e. zero indexed).
+    sku_id: Optional[:class:`int`]
+        The SKU ID this button sends you to. Can't be combined with ``url``, ``label``, ``emoji``
+        nor ``custom_id``.
+
+        .. versionadded:: 2.4
     """
 
     __item_repr_attributes__: Tuple[str, ...] = (
@@ -84,6 +91,7 @@ class Button(Item[V]):
         'label',
         'emoji',
         'row',
+        'sku_id',
     )
 
     def __init__(
@@ -96,17 +104,28 @@ class Button(Item[V]):
         url: Optional[str] = None,
         emoji: Optional[Union[str, Emoji, PartialEmoji]] = None,
         row: Optional[int] = None,
+        sku_id: Optional[int] = None,
     ):
         super().__init__()
-        if custom_id is not None and url is not None:
-            raise TypeError('cannot mix both url and custom_id with Button')
+        if custom_id is not None and (url is not None or sku_id is not None):
+            raise TypeError('cannot mix both url or sku_id and custom_id with Button')
 
+        if url is not None and sku_id is not None:
+            raise TypeError('cannot mix both url and sku_id')
+
+        requires_custom_id = url is None and sku_id is None
         self._provided_custom_id = custom_id is not None
-        if url is None and custom_id is None:
+        if requires_custom_id and custom_id is None:
             custom_id = os.urandom(16).hex()
+
+        if custom_id is not None and not isinstance(custom_id, str):
+            raise TypeError(f'expected custom_id to be str not {custom_id.__class__.__name__}')
 
         if url is not None:
             style = ButtonStyle.link
+
+        if sku_id is not None:
+            style = ButtonStyle.premium
 
         if emoji is not None:
             if isinstance(emoji, str):
@@ -114,18 +133,18 @@ class Button(Item[V]):
             elif isinstance(emoji, _EmojiTag):
                 emoji = emoji._to_partial()
             else:
-                raise TypeError(f'expected emoji to be str, Emoji, or PartialEmoji not {emoji.__class__}')
+                raise TypeError(f'expected emoji to be str, Emoji, or PartialEmoji not {emoji.__class__.__name__}')
 
         self._underlying = ButtonComponent._raw_construct(
-            type=ComponentType.button,
             custom_id=custom_id,
             url=url,
             disabled=disabled,
             label=label,
             style=style,
             emoji=emoji,
+            sku_id=sku_id,
         )
-        self.row: Optional[int] = row
+        self.row = row
 
     @property
     def style(self) -> ButtonStyle:
@@ -150,6 +169,7 @@ class Button(Item[V]):
             raise TypeError('custom_id must be None or str')
 
         self._underlying.custom_id = value
+        self._provided_custom_id = value is not None
 
     @property
     def url(self) -> Optional[str]:
@@ -193,9 +213,23 @@ class Button(Item[V]):
             elif isinstance(value, _EmojiTag):
                 self._underlying.emoji = value._to_partial()
             else:
-                raise TypeError(f'expected str, Emoji, or PartialEmoji, received {value.__class__} instead')
+                raise TypeError(f'expected str, Emoji, or PartialEmoji, received {value.__class__.__name__} instead')
         else:
             self._underlying.emoji = None
+
+    @property
+    def sku_id(self) -> Optional[int]:
+        """Optional[:class:`int`]: The SKU ID this button sends you to.
+
+        .. versionadded:: 2.4
+        """
+        return self._underlying.sku_id
+
+    @sku_id.setter
+    def sku_id(self, value: Optional[int]) -> None:
+        if value is not None:
+            self.style = ButtonStyle.premium
+        self._underlying.sku_id = value
 
     @classmethod
     def from_component(cls, button: ButtonComponent) -> Self:
@@ -207,10 +241,11 @@ class Button(Item[V]):
             url=button.url,
             emoji=button.emoji,
             row=None,
+            sku_id=button.sku_id,
         )
 
     @property
-    def type(self) -> ComponentType:
+    def type(self) -> Literal[ComponentType.button]:
         return self._underlying.type
 
     def to_component_dict(self) -> ButtonComponentPayload:
@@ -240,24 +275,26 @@ def button(
     """A decorator that attaches a button to a component.
 
     The function being decorated should have three parameters, ``self`` representing
-    the :class:`discord.ui.View`, the :class:`discord.ui.Button` being pressed and
-    the :class:`discord.Interaction` you receive.
+    the :class:`discord.ui.View`, the :class:`discord.Interaction` you receive and
+    the :class:`discord.ui.Button` being pressed.
 
     .. note::
 
-        Buttons with a URL cannot be created with this function.
+        Buttons with a URL or an SKU cannot be created with this function.
         Consider creating a :class:`Button` manually instead.
-        This is because buttons with a URL do not have a callback
+        This is because these buttons cannot have a callback
         associated with them since Discord does not do any processing
-        with it.
+        with them.
 
     Parameters
     ------------
     label: Optional[:class:`str`]
         The label of the button, if any.
+        Can only be up to 80 characters.
     custom_id: Optional[:class:`str`]
         The ID of the button that gets received during an interaction.
         It is recommended not to set this parameter to prevent conflicts.
+        Can only be up to 100 characters.
     style: :class:`.ButtonStyle`
         The style of the button. Defaults to :attr:`.ButtonStyle.grey`.
     disabled: :class:`bool`
@@ -286,6 +323,7 @@ def button(
             'label': label,
             'emoji': emoji,
             'row': row,
+            'sku_id': None,
         }
         return func
 

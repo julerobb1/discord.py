@@ -25,7 +25,7 @@ DEALINGS IN THE SOFTWARE.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING, Optional, Tuple, TypeVar
+from typing import TYPE_CHECKING, Literal, Optional, Tuple, TypeVar
 
 from ..components import TextInput as TextInputComponent
 from ..enums import ComponentType, TextStyle
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from ..types.components import TextInput as TextInputPayload
     from ..types.interactions import ModalSubmitTextInputInteractionData as ModalSubmitTextInputInteractionDataPayload
     from .view import View
+    from ..interactions import Interaction
 
 
 # fmt: off
@@ -52,27 +53,39 @@ V = TypeVar('V', bound='View', covariant=True)
 class TextInput(Item[V]):
     """Represents a UI text input.
 
+    .. container:: operations
+
+        .. describe:: str(x)
+
+            Returns the value of the text input or an empty string if the value is ``None``.
+
     .. versionadded:: 2.0
 
     Parameters
     ------------
     label: :class:`str`
         The label to display above the text input.
+        Can only be up to 45 characters.
     custom_id: :class:`str`
         The ID of the text input that gets received during an interaction.
         If not given then one is generated for you.
+        Can only be up to 100 characters.
     style: :class:`discord.TextStyle`
         The style of the text input.
     placeholder: Optional[:class:`str`]
         The placeholder text to display when the text input is empty.
+        Can only be up to 100 characters.
     default: Optional[:class:`str`]
         The default value of the text input.
+        Can only be up to 4000 characters.
     required: :class:`bool`
         Whether the text input is required.
     min_length: Optional[:class:`int`]
         The minimum length of the text input.
+        Must be between 0 and 4000.
     max_length: Optional[:class:`int`]
         The maximum length of the text input.
+        Must be between 1 and 4000.
     row: Optional[:class:`int`]
         The relative row this text input belongs to. A Discord component can only have 5
         rows. By default, items are arranged automatically into those 5 rows. If you'd
@@ -104,8 +117,10 @@ class TextInput(Item[V]):
         self._value: Optional[str] = default
         self._provided_custom_id = custom_id is not MISSING
         custom_id = os.urandom(16).hex() if custom_id is MISSING else custom_id
+        if not isinstance(custom_id, str):
+            raise TypeError(f'expected custom_id to be str not {custom_id.__class__.__name__}')
+
         self._underlying = TextInputComponent._raw_construct(
-            type=ComponentType.text_input,
             label=label,
             style=style,
             custom_id=custom_id,
@@ -115,31 +130,32 @@ class TextInput(Item[V]):
             min_length=min_length,
             max_length=max_length,
         )
-        self.row: Optional[int] = row
+        self.row = row
 
     def __str__(self) -> str:
-        return self.value or ''
+        return self.value
 
     @property
     def custom_id(self) -> str:
-        """:class:`str`: The ID of the select menu that gets received during an interaction."""
+        """:class:`str`: The ID of the text input that gets received during an interaction."""
         return self._underlying.custom_id
 
     @custom_id.setter
     def custom_id(self, value: str) -> None:
         if not isinstance(value, str):
-            raise TypeError('custom_id must be None or str')
+            raise TypeError('custom_id must be a str')
 
         self._underlying.custom_id = value
+        self._provided_custom_id = True
 
     @property
     def width(self) -> int:
         return 5
 
     @property
-    def value(self) -> Optional[str]:
-        """Optional[:class:`str`]: The value of the text input."""
-        return self._value
+    def value(self) -> str:
+        """:class:`str`: The value of the text input."""
+        return self._value or ''
 
     @property
     def label(self) -> str:
@@ -210,7 +226,7 @@ class TextInput(Item[V]):
     def _refresh_component(self, component: TextInputComponent) -> None:
         self._underlying = component
 
-    def _refresh_state(self, data: ModalSubmitTextInputInteractionDataPayload) -> None:
+    def _refresh_state(self, interaction: Interaction, data: ModalSubmitTextInputInteractionDataPayload) -> None:
         self._value = data.get('value', None)
 
     @classmethod
@@ -228,8 +244,8 @@ class TextInput(Item[V]):
         )
 
     @property
-    def type(self) -> ComponentType:
-        return ComponentType.text_input
+    def type(self) -> Literal[ComponentType.text_input]:
+        return self._underlying.type
 
     def is_dispatchable(self) -> bool:
         return False

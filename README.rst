@@ -27,6 +27,13 @@ Installing
 
 To install the library without full voice support, you can just run the following command:
 
+.. note::
+
+    A `Virtual Environment <https://docs.python.org/3/library/venv.html>`__ is recommended to install
+    the library, especially on Linux where the system Python is externally managed and restricts which
+    packages you can install on it.
+
+
 .. code:: sh
 
     # Linux/macOS
@@ -60,10 +67,10 @@ Optional Packages
 
 * `PyNaCl <https://pypi.org/project/PyNaCl/>`__ (for voice support)
 
-Please note that on Linux installing voice you must install the following packages via your favourite package manager (e.g. ``apt``, ``dnf``, etc) before running the above commands:
+Please note that when installing voice support on Linux, you must install the following packages via your favourite package manager (e.g. ``apt``, ``dnf``, etc) before running the above commands:
 
 * libffi-dev (or ``libffi-devel`` on some systems)
-* python-dev (e.g. ``python3.6-dev`` for Python 3.6)
+* python-dev (e.g. ``python3.8-dev`` for Python 3.8)
 
 Quick Example
 --------------
@@ -84,7 +91,9 @@ Quick Example
             if message.content == 'ping':
                 await message.channel.send('pong')
 
-    client = MyClient()
+    intents = discord.Intents.default()
+    intents.message_content = True
+    client = MyClient(intents=intents)
     client.run('token')
 
 Bot Example
@@ -95,7 +104,9 @@ Bot Example
     import discord
     from discord.ext import commands
 
-    bot = commands.Bot(command_prefix='>')
+    intents = discord.Intents.default()
+    intents.message_content = True
+    bot = commands.Bot(command_prefix='>', intents=intents)
 
     @bot.command()
     async def ping(ctx):

@@ -21,16 +21,19 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 """
+
 from __future__ import annotations
 
 import array
 import asyncio
+from textwrap import TextWrapper
 from typing import (
     Any,
     AsyncIterable,
     AsyncIterator,
     Awaitable,
     Callable,
+    Collection,
     Coroutine,
     Dict,
     ForwardRef,
@@ -39,12 +42,12 @@ from typing import (
     Iterator,
     List,
     Literal,
-    Mapping,
     NamedTuple,
     Optional,
     Protocol,
     Set,
     Sequence,
+    SupportsIndex,
     Tuple,
     Type,
     TypeVar,
@@ -53,17 +56,22 @@ from typing import (
     TYPE_CHECKING,
 )
 import unicodedata
-from base64 import b64encode
+from base64 import b64encode, b64decode
 from bisect import bisect_left
 import datetime
 import functools
 from inspect import isawaitable as _isawaitable, signature as _signature
 from operator import attrgetter
+from urllib.parse import urlencode
 import json
 import re
+import os
 import sys
 import types
+import typing
 import warnings
+import logging
+import zlib
 
 import yarl
 
@@ -74,6 +82,12 @@ except ModuleNotFoundError:
 else:
     HAS_ORJSON = True
 
+try:
+    import zstandard  # type: ignore
+except ImportError:
+    _HAS_ZSTD = False
+else:
+    _HAS_ZSTD = True
 
 __all__ = (
     'oauth_url',
@@ -86,21 +100,27 @@ __all__ = (
     'remove_markdown',
     'escape_markdown',
     'escape_mentions',
+    'maybe_coroutine',
     'as_chunks',
     'format_dt',
+    'MISSING',
+    'setup_logging',
 )
 
 DISCORD_EPOCH = 1420070400000
+DEFAULT_FILE_SIZE_LIMIT_BYTES = 10485760
 
 
 class _MissingSentinel:
-    def __eq__(self, other):
+    __slots__ = ()
+
+    def __eq__(self, other) -> bool:
         return False
 
-    def __bool__(self):
+    def __bool__(self) -> bool:
         return False
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return 0
 
     def __repr__(self):
@@ -111,7 +131,7 @@ MISSING: Any = _MissingSentinel()
 
 
 class _cached_property:
-    def __init__(self, function):
+    def __init__(self, function) -> None:
         self.function = function
         self.__doc__ = getattr(function, '__doc__')
 
@@ -128,22 +148,22 @@ class _cached_property:
 if TYPE_CHECKING:
     from functools import cached_property as cached_property
 
-    from typing_extensions import ParamSpec, Self
+    from typing_extensions import ParamSpec, Self, TypeGuard
 
     from .permissions import Permissions
     from .abc import Snowflake
     from .invite import Invite
     from .template import Template
 
-    class _RequestLike(Protocol):
-        headers: Mapping[str, Any]
+    class _DecompressionContext(Protocol):
+        COMPRESSION_TYPE: str
+
+        def decompress(self, data: bytes, /) -> str | None:
+            ...
 
     P = ParamSpec('P')
 
-    MaybeCoroFunc = Union[
-        Callable[P, Coroutine[Any, Any, 'T']],
-        Callable[P, 'T'],
-    ]
+    MaybeAwaitableFunc = Callable[P, 'MaybeAwaitable[T]']
 
     _SnowflakeListBase = array.array[int]
 
@@ -156,6 +176,7 @@ T = TypeVar('T')
 T_co = TypeVar('T_co', covariant=True)
 _Iter = Union[Iterable[T], AsyncIterable[T]]
 Coro = Coroutine[Any, Any, T]
+MaybeAwaitable = Union[T, Awaitable[T]]
 
 
 class CachedSlotProperty(Generic[T, T_co]):
@@ -203,31 +224,52 @@ def cached_slot_property(name: str) -> Callable[[Callable[[T], T_co]], CachedSlo
 
 
 class SequenceProxy(Sequence[T_co]):
-    """Read-only proxy of a Sequence."""
+    """A proxy of a sequence that only creates a copy when necessary."""
 
-    def __init__(self, proxied: Sequence[T_co]):
-        self.__proxied = proxied
+    def __init__(self, proxied: Collection[T_co], *, sorted: bool = False):
+        self.__proxied: Collection[T_co] = proxied
+        self.__sorted: bool = sorted
 
-    def __getitem__(self, idx: int) -> T_co:
-        return self.__proxied[idx]
+    @cached_property
+    def __copied(self) -> List[T_co]:
+        if self.__sorted:
+            # The type checker thinks the variance is wrong, probably due to the comparison requirements
+            self.__proxied = sorted(self.__proxied)  # type: ignore
+        else:
+            self.__proxied = list(self.__proxied)
+        return self.__proxied
+
+    def __repr__(self) -> str:
+        return f"SequenceProxy({self.__proxied!r})"
+
+    @overload
+    def __getitem__(self, idx: SupportsIndex) -> T_co:
+        ...
+
+    @overload
+    def __getitem__(self, idx: slice) -> List[T_co]:
+        ...
+
+    def __getitem__(self, idx: Union[SupportsIndex, slice]) -> Union[T_co, List[T_co]]:
+        return self.__copied[idx]
 
     def __len__(self) -> int:
         return len(self.__proxied)
 
     def __contains__(self, item: Any) -> bool:
-        return item in self.__proxied
+        return item in self.__copied
 
     def __iter__(self) -> Iterator[T_co]:
-        return iter(self.__proxied)
+        return iter(self.__copied)
 
     def __reversed__(self) -> Iterator[T_co]:
-        return reversed(self.__proxied)
+        return reversed(self.__copied)
 
     def index(self, value: Any, *args: Any, **kwargs: Any) -> int:
-        return self.__proxied.index(value, *args, **kwargs)
+        return self.__copied.index(value, *args, **kwargs)
 
     def count(self, value: Any) -> int:
-        return self.__proxied.count(value)
+        return self.__copied.count(value)
 
 
 @overload
@@ -251,7 +293,7 @@ def parse_time(timestamp: Optional[str]) -> Optional[datetime.datetime]:
     return None
 
 
-def copy_doc(original: Callable) -> Callable[[T], T]:
+def copy_doc(original: Callable[..., Any]) -> Callable[[T], T]:
     def decorator(overridden: T) -> T:
         overridden.__doc__ = original.__doc__
         overridden.__signature__ = _signature(original)  # type: ignore
@@ -270,7 +312,7 @@ def deprecated(instead: Optional[str] = None) -> Callable[[Callable[P, T]], Call
             else:
                 fmt = '{0.__name__} is deprecated.'
 
-            warnings.warn(fmt.format(func, instead), stacklevel=3, category=DeprecationWarning)
+            warnings.warn(fmt.format(func, instead), stacklevel=2, category=DeprecationWarning)
             warnings.simplefilter('default', DeprecationWarning)  # reset filter
             return func(*args, **kwargs)
 
@@ -285,15 +327,16 @@ def oauth_url(
     permissions: Permissions = MISSING,
     guild: Snowflake = MISSING,
     redirect_uri: str = MISSING,
-    scopes: Iterable[str] = MISSING,
+    scopes: Optional[Iterable[str]] = MISSING,
     disable_guild_select: bool = False,
+    state: str = MISSING,
 ) -> str:
     """A helper function that returns the OAuth2 URL for inviting the bot
     into guilds.
 
     .. versionchanged:: 2.0
 
-        ``permissions``, ``guild``, ``redirect_uri``, and ``scopes`` parameters
+        ``permissions``, ``guild``, ``redirect_uri``, ``scopes`` and ``state`` parameters
         are now keyword-only.
 
     Parameters
@@ -315,6 +358,10 @@ def oauth_url(
         Whether to disallow the user from changing the guild dropdown.
 
         .. versionadded:: 2.0
+    state: :class:`str`
+        The state to return after the authorization.
+
+        .. versionadded:: 2.0
 
     Returns
     --------
@@ -322,22 +369,27 @@ def oauth_url(
         The OAuth2 URL for inviting the bot into guilds.
     """
     url = f'https://discord.com/oauth2/authorize?client_id={client_id}'
-    url += '&scope=' + '+'.join(scopes or ('bot', 'applications.commands'))
+    if scopes is not None:
+        url += '&scope=' + '+'.join(scopes or ('bot', 'applications.commands'))
     if permissions is not MISSING:
         url += f'&permissions={permissions.value}'
     if guild is not MISSING:
         url += f'&guild_id={guild.id}'
-    if redirect_uri is not MISSING:
-        from urllib.parse import urlencode
-
-        url += '&response_type=code&' + urlencode({'redirect_uri': redirect_uri})
     if disable_guild_select:
         url += '&disable_guild_select=true'
+    if redirect_uri is not MISSING:
+        url += '&response_type=code&' + urlencode({'redirect_uri': redirect_uri})
+    if state is not MISSING:
+        url += f'&{urlencode({"state": state})}'
     return url
 
 
-def snowflake_time(id: int) -> datetime.datetime:
-    """
+def snowflake_time(id: int, /) -> datetime.datetime:
+    """Returns the creation time of the given snowflake.
+
+    .. versionchanged:: 2.0
+        The ``id`` parameter is now positional-only.
+
     Parameters
     -----------
     id: :class:`int`
@@ -352,14 +404,18 @@ def snowflake_time(id: int) -> datetime.datetime:
     return datetime.datetime.fromtimestamp(timestamp, tz=datetime.timezone.utc)
 
 
-def time_snowflake(dt: datetime.datetime, high: bool = False) -> int:
+def time_snowflake(dt: datetime.datetime, /, *, high: bool = False) -> int:
     """Returns a numeric snowflake pretending to be created at the given date.
 
-    When using as the lower end of a range, use ``time_snowflake(high=False) - 1``
+    When using as the lower end of a range, use ``time_snowflake(dt, high=False) - 1``
     to be inclusive, ``high=True`` to be exclusive.
 
-    When using as the higher end of a range, use ``time_snowflake(high=True) + 1``
-    to be inclusive, ``high=False`` to be exclusive
+    When using as the higher end of a range, use ``time_snowflake(dt, high=True) + 1``
+    to be inclusive, ``high=False`` to be exclusive.
+
+    .. versionchanged:: 2.0
+        The ``high`` parameter is now keyword-only and the ``dt`` parameter is now
+        positional-only.
 
     Parameters
     -----------
@@ -391,12 +447,12 @@ async def _afind(predicate: Callable[[T], Any], iterable: AsyncIterable[T], /) -
 
 
 @overload
-def find(predicate: Callable[[T], Any], iterable: Iterable[T], /) -> Optional[T]:
+def find(predicate: Callable[[T], Any], iterable: AsyncIterable[T], /) -> Coro[Optional[T]]:
     ...
 
 
 @overload
-def find(predicate: Callable[[T], Any], iterable: AsyncIterable[T], /) -> Coro[Optional[T]]:
+def find(predicate: Callable[[T], Any], iterable: Iterable[T], /) -> Optional[T]:
     ...
 
 
@@ -430,9 +486,9 @@ def find(predicate: Callable[[T], Any], iterable: _Iter[T], /) -> Union[Optional
     """
 
     return (
-        _find(predicate, iterable)  # type: ignore
-        if hasattr(iterable, '__iter__')  # isinstance(iterable, collections.abc.Iterable) is too slow
-        else _afind(predicate, iterable)  # type: ignore
+        _afind(predicate, iterable)  # type: ignore
+        if hasattr(iterable, '__aiter__')  # isinstance(iterable, collections.abc.AsyncIterable) is too slow
+        else _find(predicate, iterable)  # type: ignore
     )
 
 
@@ -477,12 +533,12 @@ async def _aget(iterable: AsyncIterable[T], /, **attrs: Any) -> Optional[T]:
 
 
 @overload
-def get(iterable: Iterable[T], /, **attrs: Any) -> Optional[T]:
+def get(iterable: AsyncIterable[T], /, **attrs: Any) -> Coro[Optional[T]]:
     ...
 
 
 @overload
-def get(iterable: AsyncIterable[T], /, **attrs: Any) -> Coro[Optional[T]]:
+def get(iterable: Iterable[T], /, **attrs: Any) -> Optional[T]:
     ...
 
 
@@ -546,9 +602,9 @@ def get(iterable: _Iter[T], /, **attrs: Any) -> Union[Optional[T], Coro[Optional
     """
 
     return (
-        _get(iterable, **attrs)  # type: ignore
-        if hasattr(iterable, '__iter__')  # isinstance(iterable, collections.abc.Iterable) is too slow
-        else _aget(iterable, **attrs)  # type: ignore
+        _aget(iterable, **attrs)  # type: ignore
+        if hasattr(iterable, '__aiter__')  # isinstance(iterable, collections.abc.AsyncIterable) is too slow
+        else _get(iterable, **attrs)  # type: ignore
     )
 
 
@@ -578,11 +634,25 @@ def _get_mime_type_for_image(data: bytes):
         raise ValueError('Unsupported image type given')
 
 
-def _bytes_to_base64_data(data: bytes) -> str:
+def _get_mime_type_for_audio(data: bytes):
+    if data.startswith(b'\x49\x44\x33') or data.startswith(b'\xff\xfb'):
+        return 'audio/mpeg'
+    else:
+        raise ValueError('Unsupported audio type given')
+
+
+def _bytes_to_base64_data(data: bytes, *, audio: bool = False) -> str:
     fmt = 'data:{mime};base64,{data}'
-    mime = _get_mime_type_for_image(data)
+    if audio:
+        mime = _get_mime_type_for_audio(data)
+    else:
+        mime = _get_mime_type_for_image(data)
     b64 = b64encode(data).decode('ascii')
     return fmt.format(mime=mime, data=b64)
+
+
+def _base64_to_bytes(data: str) -> bytes:
+    return b64decode(data.encode('ascii'))
 
 
 def _is_submodule(parent: str, child: str) -> bool:
@@ -615,7 +685,31 @@ def _parse_ratelimit_header(request: Any, *, use_clock: bool = False) -> float:
         return float(reset_after)
 
 
-async def maybe_coroutine(f: MaybeCoroFunc[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+async def maybe_coroutine(f: MaybeAwaitableFunc[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    r"""|coro|
+
+    A helper function that will await the result of a function if it's a coroutine
+    or return the result if it's not.
+
+    This is useful for functions that may or may not be coroutines.
+
+    .. versionadded:: 2.2
+
+    Parameters
+    -----------
+    f: Callable[..., Any]
+        The function or coroutine to call.
+    \*args
+        The arguments to pass to the function.
+    \*\*kwargs
+        The keyword arguments to pass to the function.
+
+    Returns
+    --------
+    Any
+        The result of the function or coroutine.
+    """
+
     value = f(*args, **kwargs)
     if _isawaitable(value):
         return await value
@@ -623,7 +717,11 @@ async def maybe_coroutine(f: MaybeCoroFunc[P, T], *args: P.args, **kwargs: P.kwa
         return value  # type: ignore
 
 
-async def async_all(gen: Iterable[Awaitable[T]], *, check: Callable[[T], bool] = _isawaitable) -> bool:
+async def async_all(
+    gen: Iterable[Union[T, Awaitable[T]]],
+    *,
+    check: Callable[[Union[T, Awaitable[T]]], TypeGuard[Awaitable[T]]] = _isawaitable,
+) -> bool:
     for elem in gen:
         if check(elem):
             elem = await elem
@@ -645,7 +743,7 @@ async def sane_wait_for(futures: Iterable[Awaitable[T]], *, timeout: Optional[fl
 def get_slots(cls: Type[Any]) -> Iterator[str]:
     for mro in reversed(cls.__mro__):
         try:
-            yield from mro.__slots__  # type: ignore
+            yield from mro.__slots__
         except AttributeError:
             continue
 
@@ -655,6 +753,16 @@ def compute_timedelta(dt: datetime.datetime) -> float:
         dt = dt.astimezone()
     now = datetime.datetime.now(datetime.timezone.utc)
     return max((dt - now).total_seconds(), 0)
+
+
+@overload
+async def sleep_until(when: datetime.datetime, result: T) -> T:
+    ...
+
+
+@overload
+async def sleep_until(when: datetime.datetime) -> None:
+    ...
 
 
 async def sleep_until(when: datetime.datetime, result: Optional[T] = None) -> Optional[T]:
@@ -734,14 +842,10 @@ class SnowflakeList(_SnowflakeListBase):
         return i != len(self) and self[i] == element
 
 
-_IS_ASCII = re.compile(r'^[\x00-\x7f]+$')
-
-
-def _string_width(string: str, *, _IS_ASCII=_IS_ASCII) -> int:
+def _string_width(string: str) -> int:
     """Returns string's width."""
-    match = _IS_ASCII.match(string)
-    if match:
-        return match.endpos
+    if string.isascii():
+        return len(string)
 
     UNICODE_WIDE_CHAR_TYPE = 'WFA'
     func = unicodedata.east_asian_width
@@ -765,6 +869,12 @@ def resolve_invite(invite: Union[Invite, str]) -> ResolvedInvite:
     invite: Union[:class:`~discord.Invite`, :class:`str`]
         The invite.
 
+    Raises
+    -------
+    ValueError
+        The invite is not a valid Discord invite, e.g. is not a URL
+        or does not contain alphanumeric characters.
+
     Returns
     --------
     :class:`.ResolvedInvite`
@@ -784,7 +894,12 @@ def resolve_invite(invite: Union[Invite, str]) -> ResolvedInvite:
             event_id = url.query.get('event')
 
             return ResolvedInvite(code, int(event_id) if event_id else None)
-    return ResolvedInvite(invite, None)
+
+        allowed_characters = r'[a-zA-Z0-9\-_]+'
+        if not re.fullmatch(allowed_characters, invite):
+            raise ValueError('Invite contains characters that are not allowed')
+
+        return ResolvedInvite(invite, None)
 
 
 def resolve_template(code: Union[Template, str]) -> str:
@@ -817,7 +932,7 @@ def resolve_template(code: Union[Template, str]) -> str:
 
 _MARKDOWN_ESCAPE_SUBREGEX = '|'.join(r'\{0}(?=([\s\S]*((?<!\{0})\{0})))'.format(c) for c in ('*', '`', '_', '~', '|'))
 
-_MARKDOWN_ESCAPE_COMMON = r'^>(?:>>)?\s|\[.+\]\(.+\)'
+_MARKDOWN_ESCAPE_COMMON = r'^>(?:>>)?\s|\[.+\]\(.+\)|^#{1,3}|^\s*-'
 
 _MARKDOWN_ESCAPE_REGEX = re.compile(fr'(?P<markdown>{_MARKDOWN_ESCAPE_SUBREGEX}|{_MARKDOWN_ESCAPE_COMMON})', re.MULTILINE)
 
@@ -850,7 +965,7 @@ def remove_markdown(text: str, *, ignore_links: bool = True) -> str:
         The text with the markdown special characters removed.
     """
 
-    def replacement(match):
+    def replacement(match: re.Match[str]) -> str:
         groupdict = match.groupdict()
         return groupdict.get('url', '')
 
@@ -958,12 +1073,12 @@ async def _achunk(iterator: AsyncIterable[T], max_size: int) -> AsyncIterator[Li
 
 
 @overload
-def as_chunks(iterator: Iterable[T], max_size: int) -> Iterator[List[T]]:
+def as_chunks(iterator: AsyncIterable[T], max_size: int) -> AsyncIterator[List[T]]:
     ...
 
 
 @overload
-def as_chunks(iterator: AsyncIterable[T], max_size: int) -> AsyncIterator[List[T]]:
+def as_chunks(iterator: Iterable[T], max_size: int) -> Iterator[List[T]]:
     ...
 
 
@@ -998,6 +1113,7 @@ def as_chunks(iterator: _Iter[T], max_size: int) -> _Iter[List[T]]:
 
 
 PY_310 = sys.version_info >= (3, 10)
+PY_312 = sys.version_info >= (3, 12)
 
 
 def flatten_literal_params(parameters: Iterable[Any]) -> Tuple[Any, ...]:
@@ -1032,9 +1148,24 @@ def evaluate_annotation(
     if implicit_str and isinstance(tp, str):
         if tp in cache:
             return cache[tp]
-        evaluated = eval(tp, globals, locals)
+        evaluated = evaluate_annotation(eval(tp, globals, locals), globals, locals, cache)
         cache[tp] = evaluated
-        return evaluate_annotation(evaluated, globals, locals, cache)
+        return evaluated
+
+    if PY_312 and getattr(tp.__repr__, '__objclass__', None) is typing.TypeAliasType:  # type: ignore
+        temp_locals = dict(**locals, **{t.__name__: t for t in tp.__type_params__})
+        annotation = evaluate_annotation(tp.__value__, globals, temp_locals, cache.copy())
+        if hasattr(tp, '__args__'):
+            annotation = annotation[tp.__args__]
+        return annotation
+
+    if hasattr(tp, '__supertype__'):
+        return evaluate_annotation(tp.__supertype__, globals, locals, cache)
+
+    if hasattr(tp, '__metadata__'):
+        # Annotated[X, Y] can access Y via __metadata__
+        metadata = tp.__metadata__[0]
+        return evaluate_annotation(metadata, globals, locals, cache)
 
     if hasattr(tp, '__args__'):
         implicit_str = True
@@ -1149,3 +1280,263 @@ def format_dt(dt: datetime.datetime, /, style: Optional[TimestampStyle] = None) 
     if style is None:
         return f'<t:{int(dt.timestamp())}>'
     return f'<t:{int(dt.timestamp())}:{style}>'
+
+
+def is_docker() -> bool:
+    path = '/proc/self/cgroup'
+    return os.path.exists('/.dockerenv') or (os.path.isfile(path) and any('docker' in line for line in open(path)))
+
+
+def stream_supports_colour(stream: Any) -> bool:
+    is_a_tty = hasattr(stream, 'isatty') and stream.isatty()
+
+    # Pycharm and Vscode support colour in their inbuilt editors
+    if 'PYCHARM_HOSTED' in os.environ or os.environ.get('TERM_PROGRAM') == 'vscode':
+        return is_a_tty
+
+    if sys.platform != 'win32':
+        # Docker does not consistently have a tty attached to it
+        return is_a_tty or is_docker()
+
+    # ANSICON checks for things like ConEmu
+    # WT_SESSION checks if this is Windows Terminal
+    return is_a_tty and ('ANSICON' in os.environ or 'WT_SESSION' in os.environ)
+
+
+class _ColourFormatter(logging.Formatter):
+
+    # ANSI codes are a bit weird to decipher if you're unfamiliar with them, so here's a refresher
+    # It starts off with a format like \x1b[XXXm where XXX is a semicolon separated list of commands
+    # The important ones here relate to colour.
+    # 30-37 are black, red, green, yellow, blue, magenta, cyan and white in that order
+    # 40-47 are the same except for the background
+    # 90-97 are the same but "bright" foreground
+    # 100-107 are the same as the bright ones but for the background.
+    # 1 means bold, 2 means dim, 0 means reset, and 4 means underline.
+
+    LEVEL_COLOURS = [
+        (logging.DEBUG, '\x1b[40;1m'),
+        (logging.INFO, '\x1b[34;1m'),
+        (logging.WARNING, '\x1b[33;1m'),
+        (logging.ERROR, '\x1b[31m'),
+        (logging.CRITICAL, '\x1b[41m'),
+    ]
+
+    FORMATS = {
+        level: logging.Formatter(
+            f'\x1b[30;1m%(asctime)s\x1b[0m {colour}%(levelname)-8s\x1b[0m \x1b[35m%(name)s\x1b[0m %(message)s',
+            '%Y-%m-%d %H:%M:%S',
+        )
+        for level, colour in LEVEL_COLOURS
+    }
+
+    def format(self, record):
+        formatter = self.FORMATS.get(record.levelno)
+        if formatter is None:
+            formatter = self.FORMATS[logging.DEBUG]
+
+        # Override the traceback to always print in red
+        if record.exc_info:
+            text = formatter.formatException(record.exc_info)
+            record.exc_text = f'\x1b[31m{text}\x1b[0m'
+
+        output = formatter.format(record)
+
+        # Remove the cache layer
+        record.exc_text = None
+        return output
+
+
+def setup_logging(
+    *,
+    handler: logging.Handler = MISSING,
+    formatter: logging.Formatter = MISSING,
+    level: int = MISSING,
+    root: bool = True,
+) -> None:
+    """A helper function to setup logging.
+
+    This is superficially similar to :func:`logging.basicConfig` but
+    uses different defaults and a colour formatter if the stream can
+    display colour.
+
+    This is used by the :class:`~discord.Client` to set up logging
+    if ``log_handler`` is not ``None``.
+
+    .. versionadded:: 2.0
+
+    Parameters
+    -----------
+    handler: :class:`logging.Handler`
+        The log handler to use for the library's logger.
+
+        The default log handler if not provided is :class:`logging.StreamHandler`.
+    formatter: :class:`logging.Formatter`
+        The formatter to use with the given log handler. If not provided then it
+        defaults to a colour based logging formatter (if available). If colour
+        is not available then a simple logging formatter is provided.
+    level: :class:`int`
+        The default log level for the library's logger. Defaults to ``logging.INFO``.
+    root: :class:`bool`
+        Whether to set up the root logger rather than the library logger.
+        Unlike the default for :class:`~discord.Client`, this defaults to ``True``.
+    """
+
+    if level is MISSING:
+        level = logging.INFO
+
+    if handler is MISSING:
+        handler = logging.StreamHandler()
+
+    if formatter is MISSING:
+        if isinstance(handler, logging.StreamHandler) and stream_supports_colour(handler.stream):
+            formatter = _ColourFormatter()
+        else:
+            dt_fmt = '%Y-%m-%d %H:%M:%S'
+            formatter = logging.Formatter('[{asctime}] [{levelname:<8}] {name}: {message}', dt_fmt, style='{')
+
+    if root:
+        logger = logging.getLogger()
+    else:
+        library, _, _ = __name__.partition('.')
+        logger = logging.getLogger(library)
+
+    handler.setFormatter(formatter)
+    logger.setLevel(level)
+    logger.addHandler(handler)
+
+
+def _shorten(
+    input: str,
+    *,
+    _wrapper: TextWrapper = TextWrapper(width=100, max_lines=1, replace_whitespace=True, placeholder='…'),
+) -> str:
+    try:
+        # split on the first double newline since arguments may appear after that
+        input, _ = re.split(r'\n\s*\n', input, maxsplit=1)
+    except ValueError:
+        pass
+    return _wrapper.fill(' '.join(input.strip().split()))
+
+
+CAMEL_CASE_REGEX = re.compile(r'(?<!^)(?=[A-Z])')
+
+
+def _to_kebab_case(text: str) -> str:
+    return CAMEL_CASE_REGEX.sub('-', text).lower()
+
+
+def _human_join(seq: Sequence[str], /, *, delimiter: str = ', ', final: str = 'or') -> str:
+    size = len(seq)
+    if size == 0:
+        return ''
+
+    if size == 1:
+        return seq[0]
+
+    if size == 2:
+        return f'{seq[0]} {final} {seq[1]}'
+
+    return delimiter.join(seq[:-1]) + f' {final} {seq[-1]}'
+
+
+if _HAS_ZSTD:
+
+    class _ZstdDecompressionContext:
+        __slots__ = ('context',)
+
+        COMPRESSION_TYPE: str = 'zstd-stream'
+
+        def __init__(self) -> None:
+            decompressor = zstandard.ZstdDecompressor()
+            self.context = decompressor.decompressobj()
+
+        def decompress(self, data: bytes, /) -> str | None:
+            # Each WS message is a complete gateway message
+            return self.context.decompress(data).decode('utf-8')
+
+    _ActiveDecompressionContext: Type[_DecompressionContext] = _ZstdDecompressionContext
+else:
+
+    class _ZlibDecompressionContext:
+        __slots__ = ('context', 'buffer')
+
+        COMPRESSION_TYPE: str = 'zlib-stream'
+
+        def __init__(self) -> None:
+            self.buffer: bytearray = bytearray()
+            self.context = zlib.decompressobj()
+
+        def decompress(self, data: bytes, /) -> str | None:
+            self.buffer.extend(data)
+
+            # Check whether ending is Z_SYNC_FLUSH
+            if len(data) < 4 or data[-4:] != b'\x00\x00\xff\xff':
+                return
+
+            msg = self.context.decompress(self.buffer)
+            self.buffer = bytearray()
+
+            return msg.decode('utf-8')
+
+    _ActiveDecompressionContext: Type[_DecompressionContext] = _ZlibDecompressionContext
+
+
+def _format_call_duration(duration: datetime.timedelta) -> str:
+    seconds = duration.total_seconds()
+
+    minutes_s = 60
+    hours_s = minutes_s * 60
+    days_s = hours_s * 24
+    # Discord uses approx. 1/12 of 365.25 days (avg. days per year)
+    months_s = days_s * 30.4375
+    years_s = months_s * 12
+
+    threshold_s = 45
+    threshold_m = 45
+    threshold_h = 21.5
+    threshold_d = 25.5
+    threshold_M = 10.5
+
+    if seconds < threshold_s:
+        formatted = "a few seconds"
+    elif seconds < (threshold_m * minutes_s):
+        minutes = round(seconds / minutes_s)
+        if minutes == 1:
+            formatted = "a minute"
+        else:
+            formatted = f"{minutes} minutes"
+    elif seconds < (threshold_h * hours_s):
+        hours = round(seconds / hours_s)
+        if hours == 1:
+            formatted = "an hour"
+        else:
+            formatted = f"{hours} hours"
+    elif seconds < (threshold_d * days_s):
+        days = round(seconds / days_s)
+        if days == 1:
+            formatted = "a day"
+        else:
+            formatted = f"{days} days"
+    elif seconds < (threshold_M * months_s):
+        months = round(seconds / months_s)
+        if months == 1:
+            formatted = "a month"
+        else:
+            formatted = f"{months} months"
+    else:
+        years = round(seconds / years_s)
+        if years == 1:
+            formatted = "a year"
+        else:
+            formatted = f"{years} years"
+
+    return formatted
+
+
+class _RawReprMixin:
+    __slots__: Tuple[str, ...] = ()
+
+    def __repr__(self) -> str:
+        value = ' '.join(f'{attr}={getattr(self, attr)!r}' for attr in self.__slots__)
+        return f'<{self.__class__.__name__} {value}>'

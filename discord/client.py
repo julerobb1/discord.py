@@ -27,9 +27,8 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
-import sys
-import traceback
 from typing import (
+    TYPE_CHECKING,
     Any,
     AsyncIterator,
     Callable,
@@ -37,25 +36,27 @@ from typing import (
     Dict,
     Generator,
     List,
+    Literal,
     Optional,
     Sequence,
-    TYPE_CHECKING,
     Tuple,
     Type,
     TypeVar,
     Union,
+    overload,
 )
 
 import aiohttp
 
+from .sku import SKU, Entitlement
 from .user import User, ClientUser
 from .invite import Invite
 from .template import Template
 from .widget import Widget
-from .guild import Guild
+from .guild import Guild, GuildPreview
 from .emoji import Emoji
 from .channel import _threaded_channel_factory, PartialMessageable
-from .enums import ChannelType
+from .enums import ChannelType, EntitlementOwnerType
 from .mentions import AllowedMentions
 from .errors import *
 from .enums import Status
@@ -72,20 +73,54 @@ from .backoff import ExponentialBackoff
 from .webhook import Webhook
 from .appinfo import AppInfo
 from .ui.view import View
+from .ui.dynamic import DynamicItem
 from .stage_instance import StageInstance
 from .threads import Thread
 from .sticker import GuildSticker, StandardSticker, StickerPack, _sticker_factory
+from .soundboard import SoundboardDefaultSound, SoundboardSound
 
 if TYPE_CHECKING:
-    from typing_extensions import Self
     from types import TracebackType
-    from .types.guild import Guild as GuildPayload
-    from .abc import SnowflakeTime, Snowflake, PrivateChannel
+
+    from typing_extensions import Self
+
+    from .abc import Messageable, PrivateChannel, Snowflake, SnowflakeTime
+    from .app_commands import Command, ContextMenu
+    from .automod import AutoModAction, AutoModRule
+    from .channel import DMChannel, GroupChannel
+    from .ext.commands import AutoShardedBot, Bot, Context, CommandError
     from .guild import GuildChannel
-    from .channel import DMChannel
+    from .integrations import Integration
+    from .interactions import Interaction
+    from .member import Member, VoiceState
     from .message import Message
-    from .member import Member
+    from .raw_models import (
+        RawAppCommandPermissionsUpdateEvent,
+        RawBulkMessageDeleteEvent,
+        RawIntegrationDeleteEvent,
+        RawMemberRemoveEvent,
+        RawMessageDeleteEvent,
+        RawMessageUpdateEvent,
+        RawReactionActionEvent,
+        RawReactionClearEmojiEvent,
+        RawReactionClearEvent,
+        RawThreadDeleteEvent,
+        RawThreadMembersUpdate,
+        RawThreadUpdateEvent,
+        RawTypingEvent,
+        RawPollVoteActionEvent,
+    )
+    from .reaction import Reaction
+    from .role import Role
+    from .scheduled_event import ScheduledEvent
+    from .threads import ThreadMember
+    from .types.guild import Guild as GuildPayload
+    from .ui.item import Item
     from .voice_client import VoiceProtocol
+    from .audit_logs import AuditLogEntry
+    from .poll import PollAnswer
+    from .subscription import Subscription
+
 
 # fmt: off
 __all__ = (
@@ -93,8 +128,9 @@ __all__ = (
 )
 # fmt: on
 
-Coro = TypeVar('Coro', bound=Callable[..., Coroutine[Any, Any, Any]])
-
+T = TypeVar('T')
+Coro = Coroutine[Any, Any, T]
+CoroT = TypeVar('CoroT', bound=Callable[..., Coro[Any]])
 
 _log = logging.getLogger(__name__)
 
@@ -104,9 +140,9 @@ class _LoopSentinel:
 
     def __getattr__(self, attr: str) -> None:
         msg = (
-            'loop attribute cannot be accessed in non-async contexts. ',
-            'Consider using either an asynchronous main function and passing it to asyncio.run or ',
-            'using asynchronous initialisation hooks such as Client.setup_hook',
+            'loop attribute cannot be accessed in non-async contexts. '
+            'Consider using either an asynchronous main function and passing it to asyncio.run or '
+            'using asynchronous initialisation hooks such as Client.setup_hook'
         )
         raise AttributeError(msg)
 
@@ -117,6 +153,14 @@ _loop: Any = _LoopSentinel()
 class Client:
     r"""Represents a client connection that connects to Discord.
     This class is used to interact with the Discord WebSocket and API.
+
+    .. container:: operations
+
+        .. describe:: async with x
+
+            Asynchronously initialises the client and automatically cleans up.
+
+            .. versionadded:: 2.0
 
     A number of options can be passed to the :class:`Client`.
 
@@ -141,9 +185,11 @@ class Client:
     intents: :class:`Intents`
         The intents that you want to enable for the session. This is a way of
         disabling and enabling certain gateway events from triggering and being sent.
-        If not given, defaults to a regularly constructed :class:`Intents` class.
 
         .. versionadded:: 1.5
+
+        .. versionchanged:: 2.0
+            Parameter is now required.
     member_cache_flags: :class:`MemberCacheFlags`
         Allows for finer control over how the library caches members.
         If not given, defaults to cache as much as possible with the
@@ -191,6 +237,34 @@ class Client:
         To enable these events, this must be set to ``True``. Defaults to ``False``.
 
         .. versionadded:: 2.0
+    enable_raw_presences: :class:`bool`
+        Whether to manually enable or disable the :func:`on_raw_presence_update` event.
+
+        Setting this flag to ``True`` requires :attr:`Intents.presences` to be enabled.
+
+        By default, this flag is set to ``True`` only when :attr:`Intents.presences` is enabled and :attr:`Intents.members`
+        is disabled, otherwise it's set to ``False``.
+
+        .. versionadded:: 2.5
+    http_trace: :class:`aiohttp.TraceConfig`
+        The trace configuration to use for tracking HTTP requests the library does using ``aiohttp``.
+        This allows you to check requests the library is using. For more information, check the
+        `aiohttp documentation <https://docs.aiohttp.org/en/stable/client_advanced.html#client-tracing>`_.
+
+        .. versionadded:: 2.0
+    max_ratelimit_timeout: Optional[:class:`float`]
+        The maximum number of seconds to wait when a non-global rate limit is encountered.
+        If a request requires sleeping for more than the seconds passed in, then
+        :exc:`~discord.RateLimited` will be raised. By default, there is no timeout limit.
+        In order to prevent misuse and unnecessary bans, the minimum value this can be
+        set to is ``30.0`` seconds.
+
+        .. versionadded:: 2.0
+    connector: Optional[:class:`aiohttp.BaseConnector`]
+        The aiohttp connector to use for this client. This can be used to control underlying aiohttp
+        behavior, such as setting a dns resolver or sslcontext.
+
+        .. versionadded:: 2.5
 
     Attributes
     -----------
@@ -198,7 +272,7 @@ class Client:
         The websocket gateway the client is currently connected to. Could be ``None``.
     """
 
-    def __init__(self, **options: Any) -> None:
+    def __init__(self, *, intents: Intents, **options: Any) -> None:
         self.loop: asyncio.AbstractEventLoop = _loop
         # self.ws is set in the connect method
         self.ws: DiscordWebSocket = None  # type: ignore
@@ -206,10 +280,21 @@ class Client:
         self.shard_id: Optional[int] = options.get('shard_id')
         self.shard_count: Optional[int] = options.get('shard_count')
 
+        connector: Optional[aiohttp.BaseConnector] = options.get('connector', None)
         proxy: Optional[str] = options.pop('proxy', None)
         proxy_auth: Optional[aiohttp.BasicAuth] = options.pop('proxy_auth', None)
         unsync_clock: bool = options.pop('assume_unsync_clock', True)
-        self.http: HTTPClient = HTTPClient(self.loop, proxy=proxy, proxy_auth=proxy_auth, unsync_clock=unsync_clock)
+        http_trace: Optional[aiohttp.TraceConfig] = options.pop('http_trace', None)
+        max_ratelimit_timeout: Optional[float] = options.pop('max_ratelimit_timeout', None)
+        self.http: HTTPClient = HTTPClient(
+            self.loop,
+            connector,
+            proxy=proxy,
+            proxy_auth=proxy_auth,
+            unsync_clock=unsync_clock,
+            http_trace=http_trace,
+            max_ratelimit_timeout=max_ratelimit_timeout,
+        )
 
         self._handlers: Dict[str, Callable[..., None]] = {
             'ready': self._handle_ready,
@@ -220,10 +305,11 @@ class Client:
         }
 
         self._enable_debug_events: bool = options.pop('enable_debug_events', False)
-        self._connection: ConnectionState = self._get_state(**options)
+        self._connection: ConnectionState[Self] = self._get_state(intents=intents, **options)
         self._connection.shard_count = self.shard_count
-        self._closed: bool = False
+        self._closing_task: Optional[asyncio.Task[None]] = None
         self._ready: asyncio.Event = MISSING
+        self._application: Optional[AppInfo] = None
         self._connection._get_websocket = self._get_websocket
         self._connection._get_client = lambda: self
 
@@ -232,7 +318,7 @@ class Client:
             _log.warning("PyNaCl is not installed, voice will NOT be supported")
 
     async def __aenter__(self) -> Self:
-        self.loop = asyncio.get_running_loop()
+        await self._async_setup_hook()
         return self
 
     async def __aexit__(
@@ -241,7 +327,10 @@ class Client:
         exc_value: Optional[BaseException],
         traceback: Optional[TracebackType],
     ) -> None:
-        if not self.is_closed():
+        # This avoids double-calling a user-provided .close()
+        if self._closing_task:
+            await self._closing_task
+        else:
             await self.close()
 
     # internals
@@ -249,7 +338,7 @@ class Client:
     def _get_websocket(self, guild_id: Optional[int] = None, *, shard_id: Optional[int] = None) -> DiscordWebSocket:
         return self.ws
 
-    def _get_state(self, **options: Any) -> ConnectionState:
+    def _get_state(self, **options: Any) -> ConnectionState[Self]:
         return ConnectionState(dispatch=self.dispatch, handlers=self._handlers, hooks=self._hooks, http=self.http, **options)
 
     def _handle_ready(self) -> None:
@@ -282,22 +371,36 @@ class Client:
         return self._connection.user
 
     @property
-    def guilds(self) -> List[Guild]:
-        """List[:class:`.Guild`]: The guilds that the connected client is a member of."""
+    def guilds(self) -> Sequence[Guild]:
+        """Sequence[:class:`.Guild`]: The guilds that the connected client is a member of."""
         return self._connection.guilds
 
     @property
-    def emojis(self) -> List[Emoji]:
-        """List[:class:`.Emoji`]: The emojis that the connected client has."""
+    def emojis(self) -> Sequence[Emoji]:
+        """Sequence[:class:`.Emoji`]: The emojis that the connected client has.
+
+        .. note::
+
+            This not include the emojis that are owned by the application.
+            Use :meth:`.fetch_application_emoji` to get those.
+        """
         return self._connection.emojis
 
     @property
-    def stickers(self) -> List[GuildSticker]:
-        """List[:class:`.GuildSticker`]: The stickers that the connected client has.
+    def stickers(self) -> Sequence[GuildSticker]:
+        """Sequence[:class:`.GuildSticker`]: The stickers that the connected client has.
 
         .. versionadded:: 2.0
         """
         return self._connection.stickers
+
+    @property
+    def soundboard_sounds(self) -> List[SoundboardSound]:
+        """List[:class:`.SoundboardSound`]: The soundboard sounds that the connected client has.
+
+        .. versionadded:: 2.5
+        """
+        return self._connection.soundboard_sounds
 
     @property
     def cached_messages(self) -> Sequence[Message]:
@@ -308,8 +411,8 @@ class Client:
         return utils.SequenceProxy(self._connection._messages or [])
 
     @property
-    def private_channels(self) -> List[PrivateChannel]:
-        """List[:class:`.abc.PrivateChannel`]: The private channels that the connected client is participating on.
+    def private_channels(self) -> Sequence[PrivateChannel]:
+        """Sequence[:class:`.abc.PrivateChannel`]: The private channels that the connected client is participating on.
 
         .. note::
 
@@ -331,8 +434,9 @@ class Client:
         """Optional[:class:`int`]: The client's application ID.
 
         If this is not passed via ``__init__`` then this is retrieved
-        through the gateway when an event contains the data. Usually
-        after :func:`~discord.on_connect` is called.
+        through the gateway when an event contains the data or after a call
+        to :meth:`~discord.Client.login`. Usually after :func:`~discord.on_connect`
+        is called.
 
         .. versionadded:: 2.0
         """
@@ -345,6 +449,22 @@ class Client:
         .. versionadded:: 2.0
         """
         return self._connection.application_flags
+
+    @property
+    def application(self) -> Optional[AppInfo]:
+        """Optional[:class:`~discord.AppInfo`]: The client's application info.
+
+        This is retrieved on :meth:`~discord.Client.login` and is not updated
+        afterwards. This allows populating the application_id without requiring a
+        gateway connection.
+
+        This is ``None`` if accessed before :meth:`~discord.Client.login` is called.
+
+        .. seealso:: The :meth:`~discord.Client.application_info` API call
+
+        .. versionadded:: 2.0
+        """
+        return self._application
 
     def is_ready(self) -> bool:
         """:class:`bool`: Specifies if the client's internal cache is ready for use."""
@@ -378,7 +498,7 @@ class Client:
         # Schedules the task
         return self.loop.create_task(wrapped, name=f'discord.py: {event_name}')
 
-    def dispatch(self, event: str, *args: Any, **kwargs: Any) -> None:
+    def dispatch(self, event: str, /, *args: Any, **kwargs: Any) -> None:
         _log.debug('Dispatching event %s', event)
         method = 'on_' + event
 
@@ -418,17 +538,21 @@ class Client:
         else:
             self._schedule_event(coro, method, *args, **kwargs)
 
-    async def on_error(self, event_method: str, *args: Any, **kwargs: Any) -> None:
+    async def on_error(self, event_method: str, /, *args: Any, **kwargs: Any) -> None:
         """|coro|
 
         The default error handler provided by the client.
 
-        By default this prints to :data:`sys.stderr` however it could be
+        By default this logs to the library logger however it could be
         overridden to have a different implementation.
         Check :func:`~discord.on_error` for more details.
+
+        .. versionchanged:: 2.0
+
+            ``event_method`` parameter is now positional-only
+            and instead of writing to ``sys.stderr`` it logs instead.
         """
-        print(f'Ignoring exception in {event_method}', file=sys.stderr)
-        traceback.print_exc()
+        _log.exception('Ignoring exception in %s', event_method)
 
     # hooks
 
@@ -466,7 +590,6 @@ class Client:
         self.loop = loop
         self.http.loop = loop
         self._connection.loop = loop
-        await self._connection.async_setup()
 
         self._ready = asyncio.Event()
 
@@ -481,6 +604,12 @@ class Client:
         This is only called once, in :meth:`login`, and will be called before
         any events are dispatched, making it a better solution than doing such
         setup in the :func:`~discord.on_ready` event.
+
+        .. warning::
+
+            Since this is called *before* the websocket connection is made therefore
+            anything that waits for the websocket will deadlock, this includes things
+            like :meth:`wait_for` and :meth:`wait_until_ready`.
 
         .. versionadded:: 2.0
         """
@@ -513,10 +642,26 @@ class Client:
 
         _log.info('logging in using static token')
 
-        await self._async_setup_hook()
+        if self.loop is _loop:
+            await self._async_setup_hook()
 
-        data = await self.http.static_login(token.strip())
+        if not isinstance(token, str):
+            raise TypeError(f'expected token to be a str, received {token.__class__.__name__} instead')
+        token = token.strip()
+
+        data = await self.http.static_login(token)
         self._connection.user = ClientUser(state=self._connection, data=data)
+        self._application = await self.application_info()
+        if self._connection.application_id is None:
+            self._connection.application_id = self._application.id
+
+        if self._application.interactions_endpoint_url is not None:
+            _log.warning(
+                'Application has an interaction endpoint URL set, this means registered components and app commands will not be received by the library.'
+            )
+
+        if not self._connection.application_flags:
+            self._connection.application_flags = self._application.flags
 
         await self.setup_hook()
 
@@ -558,9 +703,11 @@ class Client:
                 while True:
                     await self.ws.poll_event()
             except ReconnectWebSocket as e:
-                _log.info('Got a request to %s the websocket.', e.op)
+                _log.debug('Got a request to %s the websocket.', e.op)
                 self.dispatch('disconnect')
                 ws_params.update(sequence=self.ws.sequence, resume=e.resume, session=self.ws.session_id)
+                if e.resume:
+                    ws_params['gateway'] = self.ws.gateway
                 continue
             except (
                 OSError,
@@ -570,7 +717,6 @@ class Client:
                 aiohttp.ClientError,
                 asyncio.TimeoutError,
             ) as exc:
-
                 self.dispatch('disconnect')
                 if not reconnect:
                     await self.close()
@@ -584,7 +730,13 @@ class Client:
 
                 # If we get connection reset by peer then try to RESUME
                 if isinstance(exc, OSError) and exc.errno in (54, 10054):
-                    ws_params.update(sequence=self.ws.sequence, initial=False, resume=True, session=self.ws.session_id)
+                    ws_params.update(
+                        sequence=self.ws.sequence,
+                        gateway=self.ws.gateway,
+                        initial=False,
+                        resume=True,
+                        session=self.ws.session_id,
+                    )
                     continue
 
                 # We should only get this when an unhandled close code happens,
@@ -604,34 +756,36 @@ class Client:
                 # Always try to RESUME the connection
                 # If the connection is not RESUME-able then the gateway will invalidate the session.
                 # This is apparently what the official Discord client does.
-                ws_params.update(sequence=self.ws.sequence, resume=True, session=self.ws.session_id)
+                ws_params.update(
+                    sequence=self.ws.sequence,
+                    gateway=self.ws.gateway,
+                    resume=True,
+                    session=self.ws.session_id,
+                )
 
     async def close(self) -> None:
         """|coro|
 
         Closes the connection to Discord.
         """
-        if self._closed:
-            return
+        if self._closing_task:
+            return await self._closing_task
 
-        self._closed = True
+        async def _close():
+            await self._connection.close()
 
-        for voice in self.voice_clients:
-            try:
-                await voice.disconnect(force=True)
-            except Exception:
-                # if an error happens during disconnects, disregard it.
-                pass
+            if self.ws is not None and self.ws.open:
+                await self.ws.close(code=1000)
 
-        if self.ws is not None and self.ws.open:
-            await self.ws.close(code=1000)
+            await self.http.close()
 
-        await self.http.close()
+            if self._ready is not MISSING:
+                self._ready.clear()
 
-        if self._ready is not MISSING:
-            self._ready.clear()
+            self.loop = MISSING
 
-        self.loop = MISSING
+        self._closing_task = asyncio.create_task(_close())
+        await self._closing_task
 
     def clear(self) -> None:
         """Clears the internal state of the bot.
@@ -640,15 +794,26 @@ class Client:
         and :meth:`is_ready` both return ``False`` along with the bot's internal
         cache cleared.
         """
-        self._closed = False
+        self._closing_task = None
         self._ready.clear()
         self._connection.clear()
-        self.http.recreate()
+        self.http.clear()
 
     async def start(self, token: str, *, reconnect: bool = True) -> None:
         """|coro|
 
         A shorthand coroutine for :meth:`login` + :meth:`connect`.
+
+        Parameters
+        -----------
+        token: :class:`str`
+            The authentication token. Do not prefix this token with
+            anything as the library will do it for you.
+        reconnect: :class:`bool`
+            If we should attempt reconnecting, either due to internet
+            failure or a specific failure on Discord's part. Certain
+            disconnects that lead to bad state will not be handled (such as
+            invalid sharding payloads or bad tokens).
 
         Raises
         -------
@@ -658,7 +823,16 @@ class Client:
         await self.login(token)
         await self.connect(reconnect=reconnect)
 
-    def run(self, *args: Any, **kwargs: Any) -> None:
+    def run(
+        self,
+        token: str,
+        *,
+        reconnect: bool = True,
+        log_handler: Optional[logging.Handler] = MISSING,
+        log_formatter: logging.Formatter = MISSING,
+        log_level: int = MISSING,
+        root_logger: bool = False,
+    ) -> None:
         """A blocking call that abstracts away the event loop
         initialisation from you.
 
@@ -666,23 +840,67 @@ class Client:
         function should not be used. Use :meth:`start` coroutine
         or :meth:`connect` + :meth:`login`.
 
-        Roughly Equivalent to: ::
-
-            try:
-                asyncio.run(self.start(*args, **kwargs))
-            except KeyboardInterrupt:
-                return
+        This function also sets up the logging library to make it easier
+        for beginners to know what is going on with the library. For more
+        advanced users, this can be disabled by passing ``None`` to
+        the ``log_handler`` parameter.
 
         .. warning::
 
             This function must be the last function to call due to the fact that it
             is blocking. That means that registration of events or anything being
             called after this function call will not execute until it returns.
+
+        Parameters
+        -----------
+        token: :class:`str`
+            The authentication token. Do not prefix this token with
+            anything as the library will do it for you.
+        reconnect: :class:`bool`
+            If we should attempt reconnecting, either due to internet
+            failure or a specific failure on Discord's part. Certain
+            disconnects that lead to bad state will not be handled (such as
+            invalid sharding payloads or bad tokens).
+        log_handler: Optional[:class:`logging.Handler`]
+            The log handler to use for the library's logger. If this is ``None``
+            then the library will not set up anything logging related. Logging
+            will still work if ``None`` is passed, though it is your responsibility
+            to set it up.
+
+            The default log handler if not provided is :class:`logging.StreamHandler`.
+
+            .. versionadded:: 2.0
+        log_formatter: :class:`logging.Formatter`
+            The formatter to use with the given log handler. If not provided then it
+            defaults to a colour based logging formatter (if available).
+
+            .. versionadded:: 2.0
+        log_level: :class:`int`
+            The default log level for the library's logger. This is only applied if the
+            ``log_handler`` parameter is not ``None``. Defaults to ``logging.INFO``.
+
+            .. versionadded:: 2.0
+        root_logger: :class:`bool`
+            Whether to set up the root logger rather than the library logger.
+            By default, only the library logger (``'discord'``) is set up. If this
+            is set to ``True`` then the root logger is set up as well.
+
+            Defaults to ``False``.
+
+            .. versionadded:: 2.0
         """
 
         async def runner():
             async with self:
-                await self.start(*args, **kwargs)
+                await self.start(token, reconnect=reconnect)
+
+        if log_handler is not None:
+            utils.setup_logging(
+                handler=log_handler,
+                formatter=log_formatter,
+                level=log_level,
+                root=root_logger,
+            )
 
         try:
             asyncio.run(runner())
@@ -696,7 +914,7 @@ class Client:
 
     def is_closed(self) -> bool:
         """:class:`bool`: Indicates if the websocket connection is closed."""
-        return self._closed
+        return self._closing_task is not None
 
     @property
     def activity(self) -> Optional[ActivityTypes]:
@@ -748,7 +966,7 @@ class Client:
         if value is None or isinstance(value, AllowedMentions):
             self._connection.allowed_mentions = value
         else:
-            raise TypeError(f'allowed_mentions must be AllowedMentions not {value.__class__!r}')
+            raise TypeError(f'allowed_mentions must be AllowedMentions not {value.__class__.__name__}')
 
     @property
     def intents(self) -> Intents:
@@ -782,9 +1000,11 @@ class Client:
         Optional[Union[:class:`.abc.GuildChannel`, :class:`.Thread`, :class:`.abc.PrivateChannel`]]
             The returned channel or ``None`` if not found.
         """
-        return self._connection.get_channel(id)  # type: ignore - The cache contains all channel types
+        return self._connection.get_channel(id)  # type: ignore # The cache contains all channel types
 
-    def get_partial_messageable(self, id: int, *, type: Optional[ChannelType] = None) -> PartialMessageable:
+    def get_partial_messageable(
+        self, id: int, *, guild_id: Optional[int] = None, type: Optional[ChannelType] = None
+    ) -> PartialMessageable:
         """Returns a partial messageable with the given channel ID.
 
         This is useful if you have a channel_id but don't want to do an API call
@@ -796,6 +1016,12 @@ class Client:
         -----------
         id: :class:`int`
             The channel ID to create a partial messageable for.
+        guild_id: Optional[:class:`int`]
+            The optional guild ID to create a partial messageable for.
+
+            This is not required to actually send messages, but it does allow the
+            :meth:`~discord.PartialMessageable.jump_url` and
+            :attr:`~discord.PartialMessageable.guild` properties to function properly.
         type: Optional[:class:`.ChannelType`]
             The underlying channel type for the partial messageable.
 
@@ -804,7 +1030,7 @@ class Client:
         :class:`.PartialMessageable`
             The partial messageable
         """
-        return PartialMessageable(state=self._connection, id=id, type=type)
+        return PartialMessageable(state=self._connection, id=id, guild_id=guild_id, type=type)
 
     def get_stage_instance(self, id: int, /) -> Optional[StageInstance]:
         """Returns a stage instance with the given stage channel ID.
@@ -902,6 +1128,23 @@ class Client:
         """
         return self._connection.get_sticker(id)
 
+    def get_soundboard_sound(self, id: int, /) -> Optional[SoundboardSound]:
+        """Returns a soundboard sound with the given ID.
+
+        .. versionadded:: 2.5
+
+        Parameters
+        ----------
+        id: :class:`int`
+            The ID to search for.
+
+        Returns
+        --------
+        Optional[:class:`.SoundboardSound`]
+            The soundboard sound or ``None`` if not found.
+        """
+        return self._connection.get_soundboard_sound(id)
+
     def get_all_channels(self) -> Generator[GuildChannel, None, None]:
         """A generator that retrieves every :class:`.abc.GuildChannel` the client can 'access'.
 
@@ -949,17 +1192,776 @@ class Client:
         """|coro|
 
         Waits until the client's internal cache is all ready.
+
+        .. warning::
+
+            Calling this inside :meth:`setup_hook` can lead to a deadlock.
         """
         if self._ready is not MISSING:
             await self._ready.wait()
+        else:
+            raise RuntimeError(
+                'Client has not been properly initialised. '
+                'Please use the login method or asynchronous context manager before calling this method'
+            )
 
-    def wait_for(
+    # App Commands
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_app_command_permissions_update'],
+        /,
+        *,
+        check: Optional[Callable[[RawAppCommandPermissionsUpdateEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawAppCommandPermissionsUpdateEvent:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['app_command_completion'],
+        /,
+        *,
+        check: Optional[Callable[[Interaction[Self], Union[Command[Any, ..., Any], ContextMenu]], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Interaction[Self], Union[Command[Any, ..., Any], ContextMenu]]:
+        ...
+
+    # AutoMod
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['automod_rule_create', 'automod_rule_update', 'automod_rule_delete'],
+        /,
+        *,
+        check: Optional[Callable[[AutoModRule], bool]],
+        timeout: Optional[float] = None,
+    ) -> AutoModRule:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['automod_action'],
+        /,
+        *,
+        check: Optional[Callable[[AutoModAction], bool]],
+        timeout: Optional[float] = None,
+    ) -> AutoModAction:
+        ...
+
+    # Channels
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['private_channel_update'],
+        /,
+        *,
+        check: Optional[Callable[[GroupChannel, GroupChannel], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[GroupChannel, GroupChannel]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['private_channel_pins_update'],
+        /,
+        *,
+        check: Optional[Callable[[PrivateChannel, datetime.datetime], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[PrivateChannel, datetime.datetime]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['guild_channel_delete', 'guild_channel_create'],
+        /,
+        *,
+        check: Optional[Callable[[GuildChannel], bool]],
+        timeout: Optional[float] = None,
+    ) -> GuildChannel:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['guild_channel_update'],
+        /,
+        *,
+        check: Optional[Callable[[GuildChannel, GuildChannel], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[GuildChannel, GuildChannel]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['guild_channel_pins_update'],
+        /,
+        *,
+        check: Optional[
+            Callable[
+                [Union[GuildChannel, Thread], Optional[datetime.datetime]],
+                bool,
+            ]
+        ],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Union[GuildChannel, Thread], Optional[datetime.datetime]]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['typing'],
+        /,
+        *,
+        check: Optional[Callable[[Messageable, Union[User, Member], datetime.datetime], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Messageable, Union[User, Member], datetime.datetime]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_typing'],
+        /,
+        *,
+        check: Optional[Callable[[RawTypingEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawTypingEvent:
+        ...
+
+    # Debug & Gateway events
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['connect', 'disconnect', 'ready', 'resumed'],
+        /,
+        *,
+        check: Optional[Callable[[], bool]],
+        timeout: Optional[float] = None,
+    ) -> None:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['shard_connect', 'shard_disconnect', 'shard_ready', 'shard_resumed'],
+        /,
+        *,
+        check: Optional[Callable[[int], bool]],
+        timeout: Optional[float] = None,
+    ) -> int:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['socket_event_type', 'socket_raw_receive'],
+        /,
+        *,
+        check: Optional[Callable[[str], bool]],
+        timeout: Optional[float] = None,
+    ) -> str:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['socket_raw_send'],
+        /,
+        *,
+        check: Optional[Callable[[Union[str, bytes]], bool]],
+        timeout: Optional[float] = None,
+    ) -> Union[str, bytes]:
+        ...
+
+    # Entitlements
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['entitlement_create', 'entitlement_update', 'entitlement_delete'],
+        /,
+        *,
+        check: Optional[Callable[[Entitlement], bool]],
+        timeout: Optional[float] = None,
+    ) -> Entitlement:
+        ...
+
+    # Guilds
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal[
+            'guild_available',
+            'guild_unavailable',
+            'guild_join',
+            'guild_remove',
+        ],
+        /,
+        *,
+        check: Optional[Callable[[Guild], bool]],
+        timeout: Optional[float] = None,
+    ) -> Guild:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['guild_update'],
+        /,
+        *,
+        check: Optional[Callable[[Guild, Guild], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Guild, Guild]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['guild_emojis_update'],
+        /,
+        *,
+        check: Optional[Callable[[Guild, Sequence[Emoji], Sequence[Emoji]], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Guild, Sequence[Emoji], Sequence[Emoji]]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['guild_stickers_update'],
+        /,
+        *,
+        check: Optional[Callable[[Guild, Sequence[GuildSticker], Sequence[GuildSticker]], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Guild, Sequence[GuildSticker], Sequence[GuildSticker]]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['invite_create', 'invite_delete'],
+        /,
+        *,
+        check: Optional[Callable[[Invite], bool]],
+        timeout: Optional[float] = None,
+    ) -> Invite:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['audit_log_entry_create'],
+        /,
+        *,
+        check: Optional[Callable[[AuditLogEntry], bool]],
+        timeout: Optional[float] = None,
+    ) -> AuditLogEntry:
+        ...
+
+    # Integrations
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['integration_create', 'integration_update'],
+        /,
+        *,
+        check: Optional[Callable[[Integration], bool]],
+        timeout: Optional[float] = None,
+    ) -> Integration:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['guild_integrations_update'],
+        /,
+        *,
+        check: Optional[Callable[[Guild], bool]],
+        timeout: Optional[float] = None,
+    ) -> Guild:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['webhooks_update'],
+        /,
+        *,
+        check: Optional[Callable[[GuildChannel], bool]],
+        timeout: Optional[float] = None,
+    ) -> GuildChannel:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_integration_delete'],
+        /,
+        *,
+        check: Optional[Callable[[RawIntegrationDeleteEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawIntegrationDeleteEvent:
+        ...
+
+    # Interactions
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['interaction'],
+        /,
+        *,
+        check: Optional[Callable[[Interaction[Self]], bool]],
+        timeout: Optional[float] = None,
+    ) -> Interaction[Self]:
+        ...
+
+    # Members
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['member_join', 'member_remove'],
+        /,
+        *,
+        check: Optional[Callable[[Member], bool]],
+        timeout: Optional[float] = None,
+    ) -> Member:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_member_remove'],
+        /,
+        *,
+        check: Optional[Callable[[RawMemberRemoveEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawMemberRemoveEvent:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['member_update', 'presence_update'],
+        /,
+        *,
+        check: Optional[Callable[[Member, Member], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Member, Member]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['user_update'],
+        /,
+        *,
+        check: Optional[Callable[[User, User], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[User, User]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['member_ban'],
+        /,
+        *,
+        check: Optional[Callable[[Guild, Union[User, Member]], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Guild, Union[User, Member]]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['member_unban'],
+        /,
+        *,
+        check: Optional[Callable[[Guild, User], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Guild, User]:
+        ...
+
+    # Messages
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['message', 'message_delete'],
+        /,
+        *,
+        check: Optional[Callable[[Message], bool]],
+        timeout: Optional[float] = None,
+    ) -> Message:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['message_edit'],
+        /,
+        *,
+        check: Optional[Callable[[Message, Message], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Message, Message]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['bulk_message_delete'],
+        /,
+        *,
+        check: Optional[Callable[[List[Message]], bool]],
+        timeout: Optional[float] = None,
+    ) -> List[Message]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_message_edit'],
+        /,
+        *,
+        check: Optional[Callable[[RawMessageUpdateEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawMessageUpdateEvent:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_message_delete'],
+        /,
+        *,
+        check: Optional[Callable[[RawMessageDeleteEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawMessageDeleteEvent:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_bulk_message_delete'],
+        /,
+        *,
+        check: Optional[Callable[[RawBulkMessageDeleteEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawBulkMessageDeleteEvent:
+        ...
+
+    # Reactions
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['reaction_add', 'reaction_remove'],
+        /,
+        *,
+        check: Optional[Callable[[Reaction, Union[Member, User]], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Reaction, Union[Member, User]]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['reaction_clear'],
+        /,
+        *,
+        check: Optional[Callable[[Message, List[Reaction]], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Message, List[Reaction]]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['reaction_clear_emoji'],
+        /,
+        *,
+        check: Optional[Callable[[Reaction], bool]],
+        timeout: Optional[float] = None,
+    ) -> Reaction:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_reaction_add', 'raw_reaction_remove'],
+        /,
+        *,
+        check: Optional[Callable[[RawReactionActionEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawReactionActionEvent:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_reaction_clear'],
+        /,
+        *,
+        check: Optional[Callable[[RawReactionClearEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawReactionClearEvent:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_reaction_clear_emoji'],
+        /,
+        *,
+        check: Optional[Callable[[RawReactionClearEmojiEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawReactionClearEmojiEvent:
+        ...
+
+    # Roles
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['guild_role_create', 'guild_role_delete'],
+        /,
+        *,
+        check: Optional[Callable[[Role], bool]],
+        timeout: Optional[float] = None,
+    ) -> Role:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['guild_role_update'],
+        /,
+        *,
+        check: Optional[Callable[[Role, Role], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Role, Role]:
+        ...
+
+    # Scheduled Events
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['scheduled_event_create', 'scheduled_event_delete'],
+        /,
+        *,
+        check: Optional[Callable[[ScheduledEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> ScheduledEvent:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['scheduled_event_user_add', 'scheduled_event_user_remove'],
+        /,
+        *,
+        check: Optional[Callable[[ScheduledEvent, User], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[ScheduledEvent, User]:
+        ...
+
+    # Stages
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['stage_instance_create', 'stage_instance_delete'],
+        /,
+        *,
+        check: Optional[Callable[[StageInstance], bool]],
+        timeout: Optional[float] = None,
+    ) -> StageInstance:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['stage_instance_update'],
+        /,
+        *,
+        check: Optional[Callable[[StageInstance, StageInstance], bool]],
+        timeout: Optional[float] = None,
+    ) -> Coroutine[Any, Any, Tuple[StageInstance, StageInstance]]:
+        ...
+
+    # Subscriptions
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['subscription_create', 'subscription_update', 'subscription_delete'],
+        /,
+        *,
+        check: Optional[Callable[[Subscription], bool]],
+        timeout: Optional[float] = None,
+    ) -> Subscription:
+        ...
+
+    # Threads
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['thread_create', 'thread_join', 'thread_remove', 'thread_delete'],
+        /,
+        *,
+        check: Optional[Callable[[Thread], bool]],
+        timeout: Optional[float] = None,
+    ) -> Thread:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['thread_update'],
+        /,
+        *,
+        check: Optional[Callable[[Thread, Thread], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Thread, Thread]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_thread_update'],
+        /,
+        *,
+        check: Optional[Callable[[RawThreadUpdateEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawThreadUpdateEvent:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_thread_delete'],
+        /,
+        *,
+        check: Optional[Callable[[RawThreadDeleteEvent], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawThreadDeleteEvent:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['thread_member_join', 'thread_member_remove'],
+        /,
+        *,
+        check: Optional[Callable[[ThreadMember], bool]],
+        timeout: Optional[float] = None,
+    ) -> ThreadMember:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_thread_member_remove'],
+        /,
+        *,
+        check: Optional[Callable[[RawThreadMembersUpdate], bool]],
+        timeout: Optional[float] = None,
+    ) -> RawThreadMembersUpdate:
+        ...
+
+    # Voice
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['voice_state_update'],
+        /,
+        *,
+        check: Optional[Callable[[Member, VoiceState, VoiceState], bool]],
+        timeout: Optional[float] = None,
+    ) -> Tuple[Member, VoiceState, VoiceState]:
+        ...
+
+    # Polls
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['poll_vote_add', 'poll_vote_remove'],
+        /,
+        *,
+        check: Optional[Callable[[Union[User, Member], PollAnswer], bool]] = None,
+        timeout: Optional[float] = None,
+    ) -> Tuple[Union[User, Member], PollAnswer]:
+        ...
+
+    @overload
+    async def wait_for(
+        self,
+        event: Literal['raw_poll_vote_add', 'raw_poll_vote_remove'],
+        /,
+        *,
+        check: Optional[Callable[[RawPollVoteActionEvent], bool]] = None,
+        timeout: Optional[float] = None,
+    ) -> RawPollVoteActionEvent:
+        ...
+
+    # Commands
+
+    @overload
+    async def wait_for(
+        self: Union[Bot, AutoShardedBot],
+        event: Literal["command", "command_completion"],
+        /,
+        *,
+        check: Optional[Callable[[Context[Any]], bool]] = None,
+        timeout: Optional[float] = None,
+    ) -> Context[Any]:
+        ...
+
+    @overload
+    async def wait_for(
+        self: Union[Bot, AutoShardedBot],
+        event: Literal["command_error"],
+        /,
+        *,
+        check: Optional[Callable[[Context[Any], CommandError], bool]] = None,
+        timeout: Optional[float] = None,
+    ) -> Tuple[Context[Any], CommandError]:
+        ...
+
+    @overload
+    async def wait_for(
         self,
         event: str,
+        /,
         *,
         check: Optional[Callable[..., bool]] = None,
         timeout: Optional[float] = None,
     ) -> Any:
+        ...
+
+    def wait_for(
+        self,
+        event: str,
+        /,
+        *,
+        check: Optional[Callable[..., bool]] = None,
+        timeout: Optional[float] = None,
+    ) -> Coro[Any]:
         """|coro|
 
         Waits for a WebSocket event to be dispatched.
@@ -1015,6 +2017,10 @@ class Client:
                     else:
                         await channel.send('\N{THUMBS UP SIGN}')
 
+        .. versionchanged:: 2.0
+
+            ``event`` parameter is now positional-only.
+
 
         Parameters
         ------------
@@ -1061,7 +2067,7 @@ class Client:
 
     # event registration
 
-    def event(self, coro: Coro) -> Coro:
+    def event(self, coro: CoroT, /) -> CoroT:
         """A decorator that registers an event to listen to.
 
         You can find more info about the events on the :ref:`documentation below <discord-api-events>`.
@@ -1076,6 +2082,10 @@ class Client:
             @client.event
             async def on_ready():
                 print('Ready!')
+
+        .. versionchanged:: 2.0
+
+            ``coro`` parameter is now positional-only.
 
         Raises
         --------
@@ -1146,7 +2156,7 @@ class Client:
                 continue
 
             if activity is not None:
-                me.activities = (activity,)  # type: ignore - Type checker does not understand the downcast here
+                me.activities = (activity,)  # type: ignore # Type checker does not understand the downcast here
             else:
                 me.activities = ()
 
@@ -1157,16 +2167,18 @@ class Client:
     async def fetch_guilds(
         self,
         *,
-        limit: Optional[int] = 100,
+        limit: Optional[int] = 200,
         before: Optional[SnowflakeTime] = None,
         after: Optional[SnowflakeTime] = None,
+        with_counts: bool = True,
     ) -> AsyncIterator[Guild]:
         """Retrieves an :term:`asynchronous iterator` that enables receiving your guilds.
 
         .. note::
 
             Using this, you will only receive :attr:`.Guild.owner`, :attr:`.Guild.icon`,
-            :attr:`.Guild.id`, and :attr:`.Guild.name` per :class:`.Guild`.
+            :attr:`.Guild.id`, :attr:`.Guild.name`, :attr:`.Guild.approximate_member_count`,
+            and :attr:`.Guild.approximate_presence_count` per :class:`.Guild`.
 
         .. note::
 
@@ -1193,7 +2205,12 @@ class Client:
             The number of guilds to retrieve.
             If ``None``, it retrieves every guild you have access to. Note, however,
             that this would make it a slow operation.
-            Defaults to ``100``.
+            Defaults to ``200``.
+
+            .. versionchanged:: 2.0
+
+                The default has been changed to 200.
+
         before: Union[:class:`.abc.Snowflake`, :class:`datetime.datetime`]
             Retrieves guilds before this date or object.
             If a datetime is provided, it is recommended to use a UTC aware datetime.
@@ -1202,6 +2219,12 @@ class Client:
             Retrieve guilds after this date or object.
             If a datetime is provided, it is recommended to use a UTC aware datetime.
             If the datetime is naive, it is assumed to be local time.
+        with_counts: :class:`bool`
+            Whether to include count information in the guilds. This fills the
+            :attr:`.Guild.approximate_member_count` and :attr:`.Guild.approximate_presence_count`
+            attributes without needing any privileged intents. Defaults to ``True``.
+
+            .. versionadded:: 2.3
 
         Raises
         ------
@@ -1214,27 +2237,27 @@ class Client:
             The guild with the guild data parsed.
         """
 
-        async def _before_strategy(retrieve, before, limit):
+        async def _before_strategy(retrieve: int, before: Optional[Snowflake], limit: Optional[int]):
             before_id = before.id if before else None
-            data = await self.http.get_guilds(retrieve, before=before_id)
+            data = await self.http.get_guilds(retrieve, before=before_id, with_counts=with_counts)
 
             if data:
                 if limit is not None:
                     limit -= len(data)
 
-                before = Object(id=int(data[-1]['id']))
+                before = Object(id=int(data[0]['id']))
 
             return data, before, limit
 
-        async def _after_strategy(retrieve, after, limit):
+        async def _after_strategy(retrieve: int, after: Optional[Snowflake], limit: Optional[int]):
             after_id = after.id if after else None
-            data = await self.http.get_guilds(retrieve, after=after_id)
+            data = await self.http.get_guilds(retrieve, after=after_id, with_counts=with_counts)
 
             if data:
                 if limit is not None:
                     limit -= len(data)
 
-                after = Object(id=int(data[0]['id']))
+                after = Object(id=int(data[-1]['id']))
 
             return data, after, limit
 
@@ -1244,29 +2267,32 @@ class Client:
             after = Object(id=time_snowflake(after, high=True))
 
         predicate: Optional[Callable[[GuildPayload], bool]] = None
-        strategy, state = _before_strategy, before
+        strategy, state = _after_strategy, after
+
+        if before:
+            strategy, state = _before_strategy, before
 
         if before and after:
             predicate = lambda m: int(m['id']) > after.id
-        elif after:
-            strategy, state = _after_strategy, after
 
         while True:
-            retrieve = min(100 if limit is None else limit, 100)
+            retrieve = 200 if limit is None else min(limit, 200)
             if retrieve < 1:
                 return
 
             data, state, limit = await strategy(retrieve, state, limit)
 
-            # Terminate loop on next iteration; there's no data left after this
-            if len(data) < 100:
-                limit = 0
-
             if predicate:
                 data = filter(predicate, data)
 
-            for raw_guild in data:
+            count = 0
+
+            for count, raw_guild in enumerate(data, 1):
                 yield Guild(state=self._connection, data=raw_guild)
+
+            if count < 200:
+                # There's no data left after this
+                break
 
     async def fetch_template(self, code: Union[Template, str]) -> Template:
         """|coro|
@@ -1312,6 +2338,11 @@ class Client:
 
             ``guild_id`` parameter is now positional-only.
 
+
+        Parameters
+        -----------
+        guild_id: :class:`int`
+            The guild's ID to fetch from.
         with_counts: :class:`bool`
             Whether to include count information in the guild. This fills the
             :attr:`.Guild.approximate_member_count` and :attr:`.Guild.approximate_presence_count`
@@ -1319,15 +2350,10 @@ class Client:
 
             .. versionadded:: 2.0
 
-        Parameters
-        -----------
-        guild_id: :class:`int`
-            The guild's ID to fetch from.
-
         Raises
         ------
-        Forbidden
-            You do not have access to the guild.
+        NotFound
+            The guild doesn't exist or you got no access to it.
         HTTPException
             Getting the guild failed.
 
@@ -1338,6 +2364,29 @@ class Client:
         """
         data = await self.http.get_guild(guild_id, with_counts=with_counts)
         return Guild(data=data, state=self._connection)
+
+    async def fetch_guild_preview(self, guild_id: int) -> GuildPreview:
+        """|coro|
+
+        Retrieves a preview of a :class:`.Guild` from an ID. If the guild is discoverable,
+        you don't have to be a member of it.
+
+        .. versionadded:: 2.5
+
+        Raises
+        ------
+        NotFound
+            The guild doesn't exist, or is not discoverable and you are not in it.
+        HTTPException
+            Getting the guild failed.
+
+        Returns
+        --------
+        :class:`.GuildPreview`
+            The guild preview from the ID.
+        """
+        data = await self.http.get_guild_preview(guild_id)
+        return GuildPreview(data=data, state=self._connection)
 
     async def create_guild(
         self,
@@ -1353,7 +2402,7 @@ class Client:
         Bot accounts in more than 10 guilds are not allowed to create guilds.
 
         .. versionchanged:: 2.0
-            ``name`` and ``icon`` parameters are now keyword-only. The `region`` parameter has been removed.
+            ``name`` and ``icon`` parameters are now keyword-only. The ``region`` parameter has been removed.
 
         .. versionchanged:: 2.0
             This function will now raise :exc:`ValueError` instead of
@@ -1502,7 +2551,7 @@ class Client:
 
         Revokes an :class:`.Invite`, URL, or ID to an invite.
 
-        You must have the :attr:`~.Permissions.manage_channels` permission in
+        You must have :attr:`~.Permissions.manage_channels` in
         the associated guild to do this.
 
         .. versionchanged:: 2.0
@@ -1579,8 +2628,6 @@ class Client:
             The bot's application information.
         """
         data = await self.http.application_info()
-        if 'rpc_origins' not in data:
-            data['rpc_origins'] = None
         return AppInfo(self._connection, data)
 
     async def fetch_user(self, user_id: int, /) -> User:
@@ -1661,8 +2708,8 @@ class Client:
         else:
             # the factory can't be a DMChannel or GroupChannel here
             guild_id = int(data['guild_id'])  # type: ignore
-            guild = self.get_guild(guild_id) or Object(id=guild_id)
-            # GuildChannels expect a Guild, we may be passing an Object
+            guild = self._connection._get_or_create_unavailable_guild(guild_id)
+            # the factory should be a GuildChannel or Thread
             channel = factory(guild=guild, state=self._connection, data=data)  # type: ignore
 
         return channel
@@ -1717,6 +2764,248 @@ class Client:
         # The type checker is not smart enough to figure out the constructor is correct
         return cls(state=self._connection, data=data)  # type: ignore
 
+    async def fetch_skus(self) -> List[SKU]:
+        """|coro|
+
+        Retrieves the bot's available SKUs.
+
+        .. versionadded:: 2.4
+
+        Raises
+        -------
+        MissingApplicationID
+            The application ID could not be found.
+        HTTPException
+            Retrieving the SKUs failed.
+
+        Returns
+        --------
+        List[:class:`.SKU`]
+            The bot's available SKUs.
+        """
+
+        if self.application_id is None:
+            raise MissingApplicationID
+
+        data = await self.http.get_skus(self.application_id)
+        return [SKU(state=self._connection, data=sku) for sku in data]
+
+    async def fetch_entitlement(self, entitlement_id: int, /) -> Entitlement:
+        """|coro|
+
+        Retrieves a :class:`.Entitlement` with the specified ID.
+
+        .. versionadded:: 2.4
+
+        Parameters
+        -----------
+        entitlement_id: :class:`int`
+            The entitlement's ID to fetch from.
+
+        Raises
+        -------
+        NotFound
+            An entitlement with this ID does not exist.
+        MissingApplicationID
+            The application ID could not be found.
+        HTTPException
+            Fetching the entitlement failed.
+
+        Returns
+        --------
+        :class:`.Entitlement`
+            The entitlement you requested.
+        """
+
+        if self.application_id is None:
+            raise MissingApplicationID
+
+        data = await self.http.get_entitlement(self.application_id, entitlement_id)
+        return Entitlement(state=self._connection, data=data)
+
+    async def entitlements(
+        self,
+        *,
+        limit: Optional[int] = 100,
+        before: Optional[SnowflakeTime] = None,
+        after: Optional[SnowflakeTime] = None,
+        skus: Optional[Sequence[Snowflake]] = None,
+        user: Optional[Snowflake] = None,
+        guild: Optional[Snowflake] = None,
+        exclude_ended: bool = False,
+        exclude_deleted: bool = True,
+    ) -> AsyncIterator[Entitlement]:
+        """Retrieves an :term:`asynchronous iterator` of the :class:`.Entitlement` that applications has.
+
+        .. versionadded:: 2.4
+
+        Examples
+        ---------
+
+        Usage ::
+
+            async for entitlement in client.entitlements(limit=100):
+                print(entitlement.user_id, entitlement.ends_at)
+
+        Flattening into a list ::
+
+            entitlements = [entitlement async for entitlement in client.entitlements(limit=100)]
+            # entitlements is now a list of Entitlement...
+
+        All parameters are optional.
+
+        Parameters
+        -----------
+        limit: Optional[:class:`int`]
+            The number of entitlements to retrieve. If ``None``, it retrieves every entitlement for this application.
+            Note, however, that this would make it a slow operation. Defaults to ``100``.
+        before: Optional[Union[:class:`~discord.abc.Snowflake`, :class:`datetime.datetime`]]
+            Retrieve entitlements before this date or entitlement.
+            If a datetime is provided, it is recommended to use a UTC aware datetime.
+            If the datetime is naive, it is assumed to be local time.
+        after: Optional[Union[:class:`~discord.abc.Snowflake`, :class:`datetime.datetime`]]
+            Retrieve entitlements after this date or entitlement.
+            If a datetime is provided, it is recommended to use a UTC aware datetime.
+            If the datetime is naive, it is assumed to be local time.
+        skus: Optional[Sequence[:class:`~discord.abc.Snowflake`]]
+            A list of SKUs to filter by.
+        user: Optional[:class:`~discord.abc.Snowflake`]
+            The user to filter by.
+        guild: Optional[:class:`~discord.abc.Snowflake`]
+            The guild to filter by.
+        exclude_ended: :class:`bool`
+            Whether to exclude ended entitlements. Defaults to ``False``.
+        exclude_deleted: :class:`bool`
+            Whether to exclude deleted entitlements. Defaults to ``True``.
+
+            .. versionadded:: 2.5
+
+        Raises
+        -------
+        MissingApplicationID
+            The application ID could not be found.
+        HTTPException
+            Fetching the entitlements failed.
+        TypeError
+            Both ``after`` and ``before`` were provided, as Discord does not
+            support this type of pagination.
+
+        Yields
+        --------
+        :class:`.Entitlement`
+            The entitlement with the application.
+        """
+
+        if self.application_id is None:
+            raise MissingApplicationID
+
+        if before is not None and after is not None:
+            raise TypeError('entitlements pagination does not support both before and after')
+
+        # This endpoint paginates in ascending order.
+        endpoint = self.http.get_entitlements
+
+        async def _before_strategy(retrieve: int, before: Optional[Snowflake], limit: Optional[int]):
+            before_id = before.id if before else None
+            data = await endpoint(
+                self.application_id,  # type: ignore  # We already check for None above
+                limit=retrieve,
+                before=before_id,
+                sku_ids=[sku.id for sku in skus] if skus else None,
+                user_id=user.id if user else None,
+                guild_id=guild.id if guild else None,
+                exclude_ended=exclude_ended,
+                exclude_deleted=exclude_deleted,
+            )
+
+            if data:
+                if limit is not None:
+                    limit -= len(data)
+
+                before = Object(id=int(data[0]['id']))
+
+            return data, before, limit
+
+        async def _after_strategy(retrieve: int, after: Optional[Snowflake], limit: Optional[int]):
+            after_id = after.id if after else None
+            data = await endpoint(
+                self.application_id,  # type: ignore  # We already check for None above
+                limit=retrieve,
+                after=after_id,
+                sku_ids=[sku.id for sku in skus] if skus else None,
+                user_id=user.id if user else None,
+                guild_id=guild.id if guild else None,
+                exclude_ended=exclude_ended,
+            )
+
+            if data:
+                if limit is not None:
+                    limit -= len(data)
+
+                after = Object(id=int(data[-1]['id']))
+
+            return data, after, limit
+
+        if isinstance(before, datetime.datetime):
+            before = Object(id=utils.time_snowflake(before, high=False))
+        if isinstance(after, datetime.datetime):
+            after = Object(id=utils.time_snowflake(after, high=True))
+
+        if before:
+            strategy, state = _before_strategy, before
+        else:
+            strategy, state = _after_strategy, after
+
+        while True:
+            retrieve = 100 if limit is None else min(limit, 100)
+            if retrieve < 1:
+                return
+
+            data, state, limit = await strategy(retrieve, state, limit)
+
+            # Terminate loop on next iteration; there's no data left after this
+            if len(data) < 100:
+                limit = 0
+
+            for e in data:
+                yield Entitlement(self._connection, e)
+
+    async def create_entitlement(
+        self,
+        sku: Snowflake,
+        owner: Snowflake,
+        owner_type: EntitlementOwnerType,
+    ) -> None:
+        """|coro|
+
+        Creates a test :class:`.Entitlement` for the application.
+
+        .. versionadded:: 2.4
+
+        Parameters
+        -----------
+        sku: :class:`~discord.abc.Snowflake`
+            The SKU to create the entitlement for.
+        owner: :class:`~discord.abc.Snowflake`
+            The ID of the owner.
+        owner_type: :class:`.EntitlementOwnerType`
+            The type of the owner.
+
+        Raises
+        -------
+        MissingApplicationID
+            The application ID could not be found.
+        NotFound
+            The SKU or owner could not be found.
+        HTTPException
+            Creating the entitlement failed.
+        """
+
+        if self.application_id is None:
+            raise MissingApplicationID
+
+        await self.http.create_entitlement(self.application_id, sku.id, owner.id, owner_type.value)
+
     async def fetch_premium_sticker_packs(self) -> List[StickerPack]:
         """|coro|
 
@@ -1736,6 +3025,53 @@ class Client:
         """
         data = await self.http.list_premium_sticker_packs()
         return [StickerPack(state=self._connection, data=pack) for pack in data['sticker_packs']]
+
+    async def fetch_premium_sticker_pack(self, sticker_pack_id: int, /) -> StickerPack:
+        """|coro|
+
+        Retrieves a premium sticker pack with the specified ID.
+
+        .. versionadded:: 2.5
+
+        Parameters
+        ----------
+        sticker_pack_id: :class:`int`
+            The sticker pack's ID to fetch from.
+
+        Raises
+        -------
+        NotFound
+            A sticker pack with this ID does not exist.
+        HTTPException
+            Retrieving the sticker pack failed.
+
+        Returns
+        -------
+        :class:`.StickerPack`
+            The retrieved premium sticker pack.
+        """
+        data = await self.http.get_sticker_pack(sticker_pack_id)
+        return StickerPack(state=self._connection, data=data)
+
+    async def fetch_soundboard_default_sounds(self) -> List[SoundboardDefaultSound]:
+        """|coro|
+
+        Retrieves all default soundboard sounds.
+
+        .. versionadded:: 2.5
+
+        Raises
+        -------
+        HTTPException
+            Retrieving the default soundboard sounds failed.
+
+        Returns
+        ---------
+        List[:class:`.SoundboardDefaultSound`]
+            All default soundboard sounds.
+        """
+        data = await self.http.get_soundboard_default_sounds()
+        return [SoundboardDefaultSound(state=self._connection, data=sound) for sound in data]
 
     async def create_dm(self, user: Snowflake) -> DMChannel:
         """|coro|
@@ -1765,6 +3101,54 @@ class Client:
         data = await state.http.start_private_message(user.id)
         return state.add_dm_channel(data)
 
+    def add_dynamic_items(self, *items: Type[DynamicItem[Item[Any]]]) -> None:
+        r"""Registers :class:`~discord.ui.DynamicItem` classes for persistent listening.
+
+        This method accepts *class types* rather than instances.
+
+        .. versionadded:: 2.4
+
+        Parameters
+        -----------
+        \*items: Type[:class:`~discord.ui.DynamicItem`]
+            The classes of dynamic items to add.
+
+        Raises
+        -------
+        TypeError
+            A class is not a subclass of :class:`~discord.ui.DynamicItem`.
+        """
+
+        for item in items:
+            if not issubclass(item, DynamicItem):
+                raise TypeError(f'expected subclass of DynamicItem not {item.__name__}')
+
+        self._connection.store_dynamic_items(*items)
+
+    def remove_dynamic_items(self, *items: Type[DynamicItem[Item[Any]]]) -> None:
+        r"""Removes :class:`~discord.ui.DynamicItem` classes from persistent listening.
+
+        This method accepts *class types* rather than instances.
+
+        .. versionadded:: 2.4
+
+        Parameters
+        -----------
+        \*items: Type[:class:`~discord.ui.DynamicItem`]
+            The classes of dynamic items to remove.
+
+        Raises
+        -------
+        TypeError
+            A class is not a subclass of :class:`~discord.ui.DynamicItem`.
+        """
+
+        for item in items:
+            if not issubclass(item, DynamicItem):
+                raise TypeError(f'expected subclass of DynamicItem not {item.__name__}')
+
+        self._connection.remove_dynamic_items(*items)
+
     def add_view(self, view: View, *, message_id: Optional[int] = None) -> None:
         """Registers a :class:`~discord.ui.View` for persistent listening.
 
@@ -1787,15 +3171,18 @@ class Client:
         TypeError
             A view was not passed.
         ValueError
-            The view is not persistent. A persistent view has no timeout
+            The view is not persistent or is already finished. A persistent view has no timeout
             and all their components have an explicitly provided custom_id.
         """
 
         if not isinstance(view, View):
-            raise TypeError(f'expected an instance of View not {view.__class__!r}')
+            raise TypeError(f'expected an instance of View not {view.__class__.__name__}')
 
         if not view.is_persistent():
             raise ValueError('View is not persistent. Items need to have a custom_id set and View must have no timeout')
+
+        if view.is_finished():
+            raise ValueError('View is already finished.')
 
         self._connection.store_view(view, message_id)
 
@@ -1806,3 +3193,97 @@ class Client:
         .. versionadded:: 2.0
         """
         return self._connection.persistent_views
+
+    async def create_application_emoji(
+        self,
+        *,
+        name: str,
+        image: bytes,
+    ) -> Emoji:
+        """|coro|
+
+        Create an emoji for the current application.
+
+        .. versionadded:: 2.5
+
+        Parameters
+        ----------
+        name: :class:`str`
+            The emoji name. Must be between 2 and 32 characters long.
+        image: :class:`bytes`
+            The :term:`py:bytes-like object` representing the image data to use.
+            Only JPG, PNG and GIF images are supported.
+
+        Raises
+        ------
+        MissingApplicationID
+            The application ID could not be found.
+        HTTPException
+            Creating the emoji failed.
+
+        Returns
+        -------
+        :class:`.Emoji`
+            The emoji that was created.
+        """
+        if self.application_id is None:
+            raise MissingApplicationID
+
+        img = utils._bytes_to_base64_data(image)
+        data = await self.http.create_application_emoji(self.application_id, name, img)
+        return Emoji(guild=Object(0), state=self._connection, data=data)
+
+    async def fetch_application_emoji(self, emoji_id: int, /) -> Emoji:
+        """|coro|
+
+        Retrieves an emoji for the current application.
+
+        .. versionadded:: 2.5
+
+        Parameters
+        ----------
+        emoji_id: :class:`int`
+            The emoji ID to retrieve.
+
+        Raises
+        ------
+        MissingApplicationID
+            The application ID could not be found.
+        HTTPException
+            Retrieving the emoji failed.
+
+        Returns
+        -------
+        :class:`.Emoji`
+            The emoji requested.
+        """
+        if self.application_id is None:
+            raise MissingApplicationID
+
+        data = await self.http.get_application_emoji(self.application_id, emoji_id)
+        return Emoji(guild=Object(0), state=self._connection, data=data)
+
+    async def fetch_application_emojis(self) -> List[Emoji]:
+        """|coro|
+
+        Retrieves all emojis for the current application.
+
+        .. versionadded:: 2.5
+
+        Raises
+        -------
+        MissingApplicationID
+            The application ID could not be found.
+        HTTPException
+            Retrieving the emojis failed.
+
+        Returns
+        -------
+        List[:class:`.Emoji`]
+            The list of emojis for the current application.
+        """
+        if self.application_id is None:
+            raise MissingApplicationID
+
+        data = await self.http.get_application_emojis(self.application_id)
+        return [Emoji(guild=Object(0), state=self._connection, data=emoji) for emoji in data['items']]
